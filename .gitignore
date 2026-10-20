@@ -1,0 +1,14 @@
+# Data, model source and tokenizer are supplied separately and not redistributed.
+*.bin
+*.zip
+*.log
+*.ipynb
+a100stack/
+good_tokenizer/
+model.py
+config.py
+ngram.py
+__pycache__/
+.env
+*.key
+*.pem
