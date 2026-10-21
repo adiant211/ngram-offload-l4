@@ -105,6 +105,8 @@ def to_device(batch):
     out = dict(batch)
     for key in ("ids", "targets", "pos", "cu"):
         out[key] = batch[key].to("cuda", non_blocking=True)
+    import fla_nosync
+    fla_nosync.set_cu_seqlens(out["cu"], batch["cu_cpu_long"])  # FLA's chunk tables, built on the host
     return out
 
 
@@ -384,6 +386,8 @@ def parse():
                    help="bfloat16 halves the saved residual-stream activations (Megatron's default)")
     p.add_argument("--fast-ce", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--update-threads", type=int, default=os.cpu_count())
+    p.add_argument("--fla-nosync", action=argparse.BooleanOptionalAction, default=True,
+                   help="remove FLA's per-microbatch CPU-GPU syncs (chunk tables, CE backward)")
     p.add_argument("--layer-drop", type=float, default=0.0)
     p.add_argument("--layer-drop-dist", choices=("ild", "uniform", "ald"), default="ild")
     p.add_argument("--layer-drop-schedule", choices=("decreasing", "constant", "increasing"),
@@ -459,6 +463,9 @@ def main():
     if distributed:
         model.ngram.init_sync()
     model._loss = MethodType(bench.flat_fused_loss, model)
+    if args.fla_nosync:
+        import fla_nosync
+        log("FLA_NOSYNC", json.dumps(fla_nosync.install()))
     if args.fast_ce:
         import fast_flce
         fast_flce.install()
@@ -751,6 +758,7 @@ def main():
                           __import__("resource").RUSAGE_SELF).ru_maxrss / 2**20,
                       final_loss=step_records[-1]["loss"], losses=[r["loss"] for r in step_records],
                       cpu_input_fallbacks=model.ngram._cpu_input_fallbacks,
+                      fla_nosync=dict(__import__("fla_nosync").stats) if args.fla_nosync else None,
                       dynamo_unique_graphs=__import__("torch._dynamo.utils").
                       _dynamo.utils.counters["stats"]["unique_graphs"],
                       args=vars(args))
