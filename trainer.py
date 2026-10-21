@@ -261,6 +261,27 @@ class Checkpointer:
             self.wait()
 
 
+@torch.no_grad()
+def resync_replicas(model, optimizer):
+    """Replicated Dion3: identical inputs, but not bit-deterministic kernels, so replicas drift
+    by rounding. Broadcast rank 0's dense weights and optimizer state, flattened per dtype."""
+    import torch.distributed as dist
+    tensors = [p for p in model.parameters()]
+    for param in tensors[:]:
+        tensors += [v for v in optimizer.state.get(param, {}).values() if torch.is_tensor(v) and v.is_cuda]
+    by_dtype = {}
+    for tensor in tensors:
+        by_dtype.setdefault(tensor.dtype, []).append(tensor)
+    for group in by_dtype.values():
+        for chunk in [group[i:i + 64] for i in range(0, len(group), 64)]:
+            flat = torch.cat([t.reshape(-1) for t in chunk])
+            dist.broadcast(flat, src=0)
+            offset = 0
+            for t in chunk:
+                t.copy_(flat[offset:offset + t.numel()].view_as(t))
+                offset += t.numel()
+
+
 def discard_sparse(memory):
     """Drop this update's n-gram gradients (after a nonfinite loss or gradient norm)."""
     for slot in memory._pin_slots:
@@ -377,6 +398,8 @@ def parse():
     p.add_argument("--dion-triton", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dion-replicated", action="store_true",
                    help="multi-GPU: each rank runs the full Dion3 step (no optimizer all-gather)")
+    p.add_argument("--resync-every", type=int, default=50,
+                   help="with --dion-replicated: broadcast rank 0's weights and optimizer state every N updates")
     p.add_argument("--dion-compile", action=argparse.BooleanOptionalAction, default=True,
                    help="--no-dion-compile runs dion's helpers eagerly: much faster (re)starts")
     p.add_argument("--scalar-lr", type=float, default=3e-3)
@@ -705,6 +728,8 @@ def main():
         else:
             consecutive_skips = 0
             optimizer.step()
+            if distributed and args.dion_replicated and args.resync_every and (step + 1) % args.resync_every == 0:
+                resync_replicas(model, optimizer)
             torch.cuda.synchronize()
             sparse_begin = time.perf_counter()
             rows = model.ngram.sparse_step(mult)
