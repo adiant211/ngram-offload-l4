@@ -425,6 +425,11 @@ def parse():
     p.add_argument("--layer-drop-schedule", choices=("decreasing", "constant", "increasing"),
                    default="decreasing")
     p.add_argument("--depth-attn", choices=("off", "softmax", "uniform"), default="off")
+    p.add_argument("--delta-block", action="store_true",
+                   help="Delta Block attention residuals (Luo et al.): sublayer inputs mix block-delta sources")
+    p.add_argument("--delta-blocks", type=int, default=4, help="number of depth blocks (sources)")
+    p.add_argument("--delta-variant", choices=("repo", "paper"), default="repo",
+                   help="repo: the published code's sources; paper: true block deltas")
     p.add_argument("--eval-every", type=int, default=0)
     p.add_argument("--eval-tokens", type=int, default=1_048_576)
     p.add_argument("--eval-exit-at", type=int, default=0)
@@ -537,6 +542,11 @@ def main():
         if args.layer_drop > 0:
             layer_drop = layer_dropout.LayerDropout(len(model.blocks), args.layer_drop, args.layer_drop_dist,
                                                     args.layer_drop_schedule, args.steps, args.seed)
+    if args.delta_block:
+        # After layer dropout: its forward is replaced by one that also honours layer plans.
+        import delta_block
+        log("DELTA_BLOCK", json.dumps(delta_block.install(
+            model, args.delta_blocks, args.delta_variant, args.compile_mode, compile=args.compile != "none")))
 
     # ---- resume: weights and table before DDP and the optimizer, optimizer state after
     ckpt = Checkpointer(args.ckpt_dir, args.keep, rank, world)
