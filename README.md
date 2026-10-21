@@ -32,6 +32,27 @@ Loss and input gradients match the earlier implementation. The documented except
 
 Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-4-findings.md](docs/a100stack-iteration-4-findings.md).
 
+### Iteration 5: 700M dense + 1.2B n-gram table on one A100, recoverable
+
+32 layers (24 Gated DeltaNet + 8 gated attention), width 1,280, 716.0M dense parameters, plus a
+1.2B-parameter BF16 n-gram table in pinned host RAM. A100-SXM4-80GB, ~786k-token updates:
+
+| Microbatch × accumulation | Tokens/s | MFU | GPU memory (`nvidia-smi`) |
+|---|---:|---:|---:|
+| 16,384 × 48 (before the FLA sync removal) | 27,276 | 38.6% | 42.1 GiB |
+| **10,240 × 77 (default, < 34 GB)** | **26,456** | 37.4% | **30.7 GiB** |
+| 8,192 × 96 (before the FLA sync removal) | 22,875 | 32.4% | 26.5 GiB |
+
+- `trainer.py` is a recoverable training loop:
+  - deterministic resumable data and a WSD schedule;
+  - atomic background checkpoints (8.8 GB, 32 s) covering weights, table, optimizer and RNG state, with checksums re-verified on resume;
+  - graceful stop on SIGTERM and skipping of nonfinite updates.
+- `fla_nosync.py` removes five CPU–GPU syncs per microbatch inside FLA (+6.5%); a kernel profile showed custom kernels would add only 1–5% each.
+- `train700m.sh` restarts it from the newest complete checkpoint after a crash.
+- `recovery_test.sh` kills runs mid-update and mid-checkpoint and checks the resumed runs.
+
+See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings.md).
+
 ## How it works
 
 - **The n-gram table lives in pinned host RAM.** Each microbatch, the CPU hashes token ids, gathers the needed rows into reusable pinned buffers and ships them to the GPU asynchronously. The row gradients come back on a separate CUDA stream and a CPU worker accumulates them while the GPU keeps computing ([pinned_ngram.py](pinned_ngram.py)).
@@ -52,6 +73,12 @@ Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-
 | `depth_attention.py` | Depth-Attention value mixing across the gated-attention layers (`--depth-attn`) |
 | `layer_dropout.py` | Layer dropout with depth/time schedules and early-exit evaluation (`--layer-drop`, `--eval-exit-at`) |
 | `prepare_ab.py` | Disjoint FineWeb train/held-out fixtures for quality A/B runs |
+| `trainer.py` | Recoverable training loop (700m/500m/100m presets): streaming data, WSD schedule, atomic checkpoints, resume, signals |
+| `train700m.sh` | Supervised 700M + 1.2B run under 34 GB GPU memory; restarts from the last checkpoint |
+| `recovery_test.sh` | Crash/resume/SIGTERM test at full model size |
+| `a100_sweep.sh` | A100 microbatch/memory/layer-dropout throughput sweep |
+| `fla_nosync.py` | Removes FLA 0.5.2's per-microbatch CPU-GPU syncs (chunk tables, CE backward), with a parity check |
+| `prepare_fineweb.py` | Batched FineWeb tokenization into disjoint train/held-out files (300M tokens in ~5 min) |
 | `optim800k.py` | Fused-norm swap and precision experiments |
 | `prepare800k.py` | Builds the bounded, revision-pinned FineWeb fixture |
 | `iter3_colab.sh` | Colab runner: `setup`, `parity`, `sweep`, `confirm`, `fastce`, `dion`, `dist`, `layerdrop`, `depthab`, `profile` |
@@ -83,7 +110,15 @@ bash iter3_colab.sh parity       # n-gram correctness checks
 bash run-selected-iter3.sh       # recommended recipe: one warmup + four timed updates
 ```
 
-Each run prints a `RESULT` JSON line and appends it to `results-iter3.jsonl`, with throughput, memory peaks, stage timings and correctness flags. Add `--profile-kernels 4` for a post-timing CUDA kernel table.
+For the 700M + 1.2B training run on an A100 (after `setup` and `pip install "git+https://github.com/microsoft/dion.git@58d38ad"`):
+
+```bash
+cd /content/a100stack && python -u prepare_fineweb.py --train-tokens 300000000
+bash train700m.sh                      # resumes automatically; pkill -TERM -f trainer.py stops cleanly
+CKPT_DIR=/content/drive/MyDrive/ckpt700m CACHE_DIR=/content/drive/MyDrive/cache700m bash train700m.sh  # survives runtime loss
+```
+
+Each benchmark run prints a `RESULT` JSON line and appends it to `results-iter3.jsonl`, with throughput, memory peaks, stage timings and correctness flags. Add `--profile-kernels 4` for a post-timing CUDA kernel table.
 
 ## Scope and caveats
 
