@@ -882,6 +882,10 @@ def main():
                       cpu_input_fallbacks=model.ngram._cpu_input_fallbacks,
                       fla_nosync=dict(__import__("fla_nosync").stats) if args.fla_nosync else None,
                       replica_spread=replicas,
+                      # N-gram path stages (CPU hashing, gather, transfers, worker reduce, table step),
+                      # averaged per update over this process's updates.
+                      ngram_stage_ms_per_update={k: round(v / len(step_records) * 1000, 1)
+                                                 for k, v in getattr(model.ngram, "_pin_detail", {}).items()},
                       dynamo_unique_graphs=__import__("torch._dynamo.utils").
                       _dynamo.utils.counters["stats"]["unique_graphs"],
                       args=vars(args))
