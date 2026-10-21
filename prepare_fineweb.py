@@ -8,6 +8,8 @@ Usage: python prepare_fineweb.py --train-tokens 300000000 --val-tokens 2097153 -
 import argparse
 import hashlib
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -68,3 +70,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # The streaming reader's background threads can keep the interpreter alive after
+    # an aborted request; the files and manifest are complete by now.
+    sys.stdout.flush()
+    os._exit(0)
