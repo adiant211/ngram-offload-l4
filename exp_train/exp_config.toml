@@ -1,0 +1,89 @@
+# exp_train configuration. Edit, then: python exp.py train
+# Every key is explained in SETTINGS.md. Paths are relative to this folder.
+# One-off changes without editing: python exp.py train --set batch.micro_tokens=10240 --set run.name=try2
+
+[run]
+name = "700m-base"          # runs/<name>/ holds config, log, metrics, checkpoints; same name = resume
+seed = 1234
+runs_dir = "runs"
+cache_dir = "compile-cache" # compiled kernels; keep it to make restarts take ~1 min instead of ~12
+max_restarts = 20           # automatic restarts after crashes before giving up
+
+[data]
+train = "data/fineweb-train.bin"    # uint16 token file, documents separated by <eos>
+val = "data/fineweb-val.bin"        # held-out documents (not in train); missing file = no eval
+tokenizer = "tokenizer/tokenizer.json"
+
+[prepare]                   # python exp.py prepare (FineWeb sample-10BT, pinned revision)
+train_tokens = 1_000_000_000        # ~17 min, 2 GB on disk; a full 10B-token run needs ~10_000_000_000
+val_tokens = 2_097_153
+
+[model]
+preset = "700m"             # 700m (32 layers x 1280, 716M dense) | 500m (32 x 1024) | 100m (20 x 512)
+ngram_params = 1_200_000_000        # hashed n-gram table in CPU RAM (BF16): 2.4 GB here
+layer_drop = 0.0            # 0.2 = up to 20% per block (rising with depth): +8.6% throughput, changes training
+layer_drop_dist = "ild"     # ild: rate rises with depth | uniform | ald: every other layer
+layer_drop_schedule = "decreasing"  # decreasing to 0 over the schedule (paper) | constant | increasing
+depth_attn = "off"          # off | softmax | uniform: Depth-Attention, -0.8% throughput, unconfirmed gain
+delta_block = false         # Delta Block attention residuals: -14% throughput here, opt-in
+delta_blocks = 4
+delta_variant = "repo"      # repo: published code | paper: true block deltas
+
+# [model.shape]             # optional: change the model itself (overrides the preset; see SETTINGS.md)
+# d_model = 1280
+# n_layers = 32
+# full_attn_every = 4       # every 4th layer is softmax attention, the rest Gated DeltaNet
+# n_heads = 10              # n_heads * head_dim must equal d_model
+# n_kv_heads = 2
+# head_dim = 128
+# gdn_heads = 10            # gdn_heads * gdn_head_dim must equal d_model
+# gdn_head_dim = 128
+# ffn_dim = 3200            # multiple of 128
+# "ngram.dim" = 512
+
+[batch]
+micro_tokens = 16384        # tokens per forward pass; sets GPU memory (see SETTINGS.md table)
+grad_accum = 48             # microbatches per update; update = micro_tokens * grad_accum = 786,432
+seq_len = 1024              # longest document piece; longer documents are split
+
+[schedule]                  # warmup-stable-decay; also scales the n-gram table's learning rate
+steps = 12716               # updates; x update tokens = 10.0B tokens
+warmup_steps = 300
+decay_frac = 0.2            # final 20% of updates decay to min_lr_frac
+min_lr_frac = 0.0
+stop_at = 0                 # end this invocation after this update (0: run the schedule)
+max_minutes = 0             # stop with a checkpoint after this many minutes (0: no limit)
+
+[optimizer]
+optimizer = "dion3"         # dion3 (matrices) + AdamW (embedding, norms, gates) | adamw
+dion_lr = 0.02
+dion_fraction = 0.5
+dion_mu = 0.95
+dion_weight_decay = 0.01
+scalar_lr = 3e-3            # AdamW part of Dion3
+adamw_lr = 3e-4             # only with optimizer = "adamw"
+grad_clip = 1.0
+dion_triton = true
+dion_compile = true         # false: no ~8 min first-step compile of Dion3, slightly slower steps
+
+[performance]
+compile = "tail"            # tail: compiled residual+norm+MLP per block (fastest) | mlp | none
+compile_mode = "default"
+loss_chunks = 4
+fast_ce = true              # patched fused cross-entropy (no per-microbatch sync)
+fla_nosync = true           # FLA without CPU-GPU syncs: +6.5% at 10k microbatches
+residual_dtype = "float32"  # bfloat16 saves no memory here
+update_threads = 0          # CPU threads for the table update; 0 = all cores
+gpu_mem_cap_gib = 52        # hard cap on PyTorch's GPU memory; 0 = none
+
+[eval]
+eval_every = 250            # held-out loss every N updates (0: only at the end)
+eval_tokens = 1_048_576
+eval_exit_at = 24           # also report loss using only the first N of 32 blocks (0: off)
+
+[checkpoint]
+ckpt_minutes = 30           # checkpoint every 30 min (8.8 GB, ~5 s pause, written in background)
+ckpt_every = 0              # or every N updates
+keep = 2                    # completed checkpoints kept
+resume = "auto"             # auto: newest complete checkpoint in runs/<name>/ckpt | none | a path
+max_skips = 3               # consecutive non-finite updates skipped before exiting for a restart

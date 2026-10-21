@@ -63,6 +63,30 @@ def model_config(name, ngram_params):
     raise ValueError(name)
 
 
+def apply_model_overrides(c, items):
+    """KEY=VALUE over the preset's ModelConfig; ngram.KEY for its NgramConfig. Values take the
+    field's current type (tuples: comma-separated integers)."""
+    for item in items:
+        key, value = item.split("=", 1)
+        target, attr = (c.ngram, key[6:]) if key.startswith("ngram.") else (c, key)
+        if not hasattr(target, attr):
+            raise SystemExit(f"--model-override: unknown field {key}")
+        current = getattr(target, attr)
+        if isinstance(current, bool):
+            value = value.lower() in ("1", "true", "yes")
+        elif isinstance(current, int):
+            value = int(float(value))
+        elif isinstance(current, float):
+            value = float(value)
+        elif isinstance(current, tuple):
+            value = tuple(int(v) for v in value.split(",") if v)
+        setattr(target, attr, value)
+    if items:
+        assert c.n_heads * c.head_dim == c.d_model, "n_heads * head_dim must equal d_model"
+        assert c.gdn_heads * c.gdn_head_dim == c.d_model, "gdn_heads * gdn_head_dim must equal d_model"
+        assert c.n_heads % c.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
+
+
 # ----------------------------------------------------------------------------- data
 class Windows:
     """Global microbatch g -> fixed (tokens+1)-token window, with a fresh block order per epoch."""
@@ -379,6 +403,8 @@ def parse():
     p = argparse.ArgumentParser()
     p.add_argument("--preset", choices=("700m", "500m", "100m"), default="700m")
     p.add_argument("--ngram-params", type=int, default=1_200_000_000)
+    p.add_argument("--model-override", action="append", default=[], metavar="KEY=VALUE",
+                   help="set a ModelConfig field over the preset (ngram.* for NgramConfig), repeatable")
     p.add_argument("--tokenizer", default="/content/good_tokenizer/tokenizer.json")
     p.add_argument("--data", default="fineweb-train-train.bin")
     p.add_argument("--eval-data", default="fineweb-train-val.bin")
@@ -489,6 +515,7 @@ def main():
     signal.signal(signal.SIGINT, request_stop)
 
     c = model_config(args.preset, args.ngram_params)
+    apply_model_overrides(c, args.model_override)
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(args.tokenizer)
     assert max(tok.get_vocab().values()) + 1 == c.vocab_size
@@ -563,6 +590,8 @@ def main():
             meta = json.loads((directory / "meta.json").read_text())
             assert meta["world_size"] == world, f"saved with {meta['world_size']} ranks, running {world}"
             assert meta["preset"] == args.preset and meta["ngram_params"] == args.ngram_params
+            assert meta.get("model_config") in (None, json.loads(json.dumps(asdict(c)))), \
+                "the model configuration differs from the checkpoint's"
             dense = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
             ngram = torch.load(directory / "ngram.pt", map_location="cpu", weights_only=False)
             own = {name: torch.load(directory / f"{name}_rank{rank}.pt", map_location="cpu", weights_only=False)
