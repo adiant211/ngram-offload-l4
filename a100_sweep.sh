@@ -15,7 +15,7 @@ arm() {  # name, extra args...
 import json, sys
 r = json.loads(next(l[7:] for l in reversed(open(f"a100-{sys.argv[1]}.log").read().splitlines()) if l.startswith("RESULT ")))
 keys = ("tokens_per_second", "median_update_s", "mean_mfu", "mean_dense_opt_s", "mean_sparse_s",
-        "peak_alloc_gib", "peak_reserved_gib", "host_peak_rss_gib", "final_loss", "cpu_input_fallbacks",
+        "peak_alloc_gib", "peak_reserved_gib", "peak_device_used_gib", "host_peak_rss_gib", "final_loss", "cpu_input_fallbacks",
         "layer_drop_realized_rate")
 print("SUMMARY", sys.argv[1], json.dumps({k: r.get(k) for k in keys}))
 EOF
@@ -26,6 +26,10 @@ run_arm() {
     m24k)        arm m24k --micro-tokens 24576 --grad-accum 32 ;;
     m24k-ce2)    arm m24k-ce2 --micro-tokens 24576 --grad-accum 32 --loss-chunks 2 ;;
     m8k)         arm m8k --micro-tokens 8192 --grad-accum 96 ;;
+    m12k)        arm m12k --micro-tokens 12288 --grad-accum 64 ;;
+    m12k-ce8)    arm m12k-ce8 --micro-tokens 12288 --grad-accum 64 --loss-chunks 8 ;;
+    m8k-ld02)    arm m8k-ld02 --micro-tokens 8192 --grad-accum 96 --layer-drop 0.2 --layer-drop-schedule constant ;;
+    m12k-ld02)   arm m12k-ld02 --micro-tokens 12288 --grad-accum 64 --layer-drop 0.2 --layer-drop-schedule constant ;;
     tinytable)   arm tinytable --micro-tokens 16384 --grad-accum 48 --ngram-params 20000000 ;;
     ld02)        arm ld02 --micro-tokens 16384 --grad-accum 48 --layer-drop 0.2 --layer-drop-schedule constant ;;
     ld04)        arm ld04 --micro-tokens 16384 --grad-accum 48 --layer-drop 0.4 --layer-drop-schedule constant ;;

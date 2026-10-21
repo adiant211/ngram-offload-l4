@@ -23,6 +23,11 @@ import contextlib
 import json
 import math
 import os
+
+# Grow segments instead of caching fixed-size blocks: less fragmentation, so the reserved
+# peak stays close to the allocated peak. Must be set before CUDA initializes.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import queue
 import random
 import shutil
@@ -314,6 +319,8 @@ def parse():
     p.add_argument("--run-name", default="run")
     p.add_argument("--timing-skip", type=int, default=2, help="updates excluded from the throughput summary")
     p.add_argument("--peak-tflops", type=float, default=312.0)
+    p.add_argument("--gpu-mem-cap-gib", type=float, default=0,
+                   help="hard cap on this process's CUDA allocations (allocator fraction)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--dist-backend", choices=("nccl", "gloo"), default="nccl")
     p.add_argument("--crash-at-step", type=int, default=-1, help="test hook: hard exit during this update")
@@ -335,6 +342,14 @@ def main():
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = True
     assert stack.USE_FLA, "FLA required"
+    if args.gpu_mem_cap_gib:
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.gpu_mem_cap_gib * 2**30 / total))
+
+    def device_used_gib():
+        """What nvidia-smi reports for the device: allocator reservations plus CUDA context."""
+        free, total = torch.cuda.mem_get_info()
+        return (total - free) / 2**30
 
     stop = dict(reason=None)
 
@@ -578,7 +593,8 @@ def main():
                       tok_s=update_tokens * world / seconds, mfu=flops / seconds / peak_tflops,
                       update_s=seconds, dense_opt_s=dense_seconds, sparse_s=sparse_seconds, rows=rows,
                       tokens_seen=tokens_seen, peak_alloc_gib=torch.cuda.max_memory_allocated() / 2**30,
-                      peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30, run=args.run_name)
+                      peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30,
+                      device_used_gib=device_used_gib(), run=args.run_name)
         if args.eval_every and done % args.eval_every == 0:
             record.update(evaluate())
         if step - start_step >= args.timing_skip:
@@ -629,6 +645,7 @@ def main():
                       mean_sparse_s=float(np.mean([r["sparse_s"] for r in timed])) if timed else None,
                       peak_alloc_gib=torch.cuda.max_memory_allocated() / 2**30,
                       peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30,
+                      peak_device_used_gib=max(r["device_used_gib"] for r in step_records),
                       host_peak_rss_gib=__import__("resource").getrusage(
                           __import__("resource").RUSAGE_SELF).ru_maxrss / 2**20,
                       final_loss=step_records[-1]["loss"], losses=[r["loss"] for r in step_records],
