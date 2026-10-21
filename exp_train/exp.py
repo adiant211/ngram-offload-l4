@@ -174,6 +174,7 @@ def train(config, args):
                                           stderr=subprocess.STDOUT, text=True)
         for line in state["child"].stdout:
             sys.stdout.write(line)
+            sys.stdout.flush()
             log.write(line)
             log.flush()
         code = state["child"].wait()
