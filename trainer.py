@@ -652,8 +652,10 @@ def main():
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.adamw_lr, betas=(0.9, 0.95),
                                       weight_decay=0.01, fused=True)
-    for group_ in optimizer.param_groups:
-        group_["base_lr"] = group_["lr"]
+    # Base learning rates as plain floats, from construction (never from a checkpoint). Dion3
+    # keeps each group's "lr" as a persistent device tensor and copies anything assigned to
+    # group["lr"] into it; holding that tensor as the base compounded every schedule multiplier.
+    base_lrs = [float(group_["lr"]) for group_ in optimizer.param_groups]
 
     start_step, tokens_seen, train_seconds, skipped = 0, 0, 0.0, 0
     if resumed is not None:
@@ -742,8 +744,8 @@ def main():
     for step in range(start_step, last_step):
         begin = time.perf_counter()
         mult = lr_multiplier(step, args)
-        for group_ in optimizer.param_groups:
-            group_["lr"] = group_["base_lr"] * mult
+        for group_, base_lr in zip(optimizer.param_groups, base_lrs):
+            group_["lr"] = base_lr * mult
         optimizer.zero_grad(set_to_none=True)
         values, flops, update_tokens = [], 0.0, 0
         for micro in range(args.grad_accum):
@@ -799,7 +801,7 @@ def main():
         tokens_seen += update_tokens * world
         train_seconds += seconds
         done = step + 1
-        record = dict(step=done, loss=loss_value, lr_mult=mult, gnorm=gnorm_value,
+        record = dict(step=done, loss=loss_value, lr_mult=mult, lr=float(optimizer.param_groups[0]["lr"]), gnorm=gnorm_value,
                       tok_s=update_tokens * world / seconds, mfu=flops / seconds / peak_tflops,
                       update_s=seconds, dense_opt_s=dense_seconds, sparse_s=sparse_seconds, rows=rows,
                       tokens_seen=tokens_seen, peak_alloc_gib=torch.cuda.max_memory_allocated() / 2**30,
