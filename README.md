@@ -51,7 +51,7 @@ Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-
 - `train700m.sh` restarts it from the newest complete checkpoint after a crash.
 - `recovery_test.sh` kills runs mid-update and mid-checkpoint and checks the resumed runs.
 
-See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings.md).
+Layer dropout (p_max 0.2) adds about 10% on top. A supervised run was killed with `kill -9` and resumed from its checkpoint automatically, with matching losses. See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings.md).
 
 ## How it works
 
@@ -83,6 +83,7 @@ See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings
 | `prepare800k.py` | Builds the bounded, revision-pinned FineWeb fixture |
 | `iter3_colab.sh` | Colab runner: `setup`, `parity`, `sweep`, `confirm`, `fastce`, `dion`, `dist`, `layerdrop`, `depthab`, `profile` |
 | `run-selected-iter3.sh` | The recommended recipe |
+| `results/results-iter5.jsonl` | A100 sweep, kernel profiles, sync sites, recovery test and supervised-run records |
 | `results/results-iter3.jsonl` | Raw records for all nine iteration-3 runs, with stage timings |
 | `docs/` | Findings from every iteration, oldest to newest: 100m → ram-2560 → batch-scaling → batch6 → 800k-7gb → iteration-3 |
 | `tools/` | CPU-only sparse-update microbenchmark; local checks for the compile region, Dion3 wiring, Depth-Attention and layer dropout |

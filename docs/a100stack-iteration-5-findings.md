@@ -144,7 +144,24 @@ helpers eagerly for even faster starts.
 
 ### Supervised run
 
-MAIN_RUN
+`train700m.sh --max-minutes 40 --eval-every 25 --ckpt-minutes 10`, 300M FineWeb tokens prepared by
+`prepare_fineweb.py` (held-out documents disjoint from training documents), default
+configuration (10,240 × 77, Dion3, FLA sync removal, 31 GiB allocator cap). 54 updates, 42.6M tokens.
+
+| | |
+|---|---|
+| Throughput | 26,350 tokens/s before the kill, 26,287 after the restart (17 updates); 29.9 s per update |
+| GPU memory | 29.8 GiB allocated / 30.0 GiB reserved; device 30.6 GiB after a warm-cache start, 31.7 GiB after the cold compile (compiled-kernel and library memory outside the allocator) |
+| Host memory | 35 GiB peak RSS (table, FP32 gradient accumulator, checkpoint snapshots) |
+| Checkpoints | every 10 minutes; 4.6–4.9 s training stall each, 35 s background write |
+| Hard kill | `kill -9` at 08:45:12, during update 38, after checkpoint 35. The supervisor restarted the trainer, which verified and resumed from step 35. The first update after the restart took 75 s (warm compile cache) |
+| Resume exactness | the restarted process repeated updates 36 and 37: loss 11.47899 / 11.47947 against 11.47900 / 11.47957 before the kill |
+| Graceful stop | SIGTERM at 08:56:32: update 54 finished, blocking checkpoint 54 (38 s including the step-53 write still in flight), exit 0, supervisor finished |
+| Held-out loss (1M tokens) | 11.494 (update 25), 11.457 (50), 11.450 (54); early exit after 24 of 32 blocks: 11.490, 11.449, 11.442 |
+
+The loss barely moves because the schedule warms up over 300 updates (236M tokens), and the run
+stopped at 18% of peak learning rate. This run demonstrates the mechanics, not convergence. Rerunning
+`bash train700m.sh` continues from update 54.
 
 ## 5. Limits and next steps
 
