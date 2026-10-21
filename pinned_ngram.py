@@ -376,7 +376,9 @@ def _block_update(memory, lr_mult):
             else:
                 current.add_(rows.to(table.dtype))
             target.index_copy_(0, index, current)
-            g.zero_()  # also clears any nonfinite value in masked-out entries
+            # Only touched rows accumulate gradient (masked-out entries add exact zeros), so
+            # clearing them clears the block. A nonfinite update is discarded whole elsewhere.
+            g.index_fill_(0, index, 0.0)
             mask.zero_()
         elif count:
             touched += count
