@@ -209,7 +209,7 @@ def train(config, args):
         if stalled >= 3:
             message = "SUPERVISOR 3 failures in a row without a new checkpoint: giving up, see train.log"
             print(message, flush=True)
-            log.write(message + chr(10))
+            log.write(message + "\n")
             break
         message = f"SUPERVISOR trainer exited with {code}; resuming from the last checkpoint in 15 s"
         print(message, flush=True)
