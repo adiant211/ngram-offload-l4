@@ -16,19 +16,23 @@ import numpy as np
 import torch
 
 
-def drop_rate(layer, layers, step, horizon, p_max, distribution, schedule):
+def drop_rate(layer, layers, step, horizon, p_max, distribution, schedule, p_final=0.0):
+    """Scheduled rate times the depth profile. "decreasing" moves linearly from p_max to p_final
+    over `horizon` steps and holds p_final afterwards (p_final = 0: the paper's schedule)."""
     if distribution == "ild":
-        p = p_max*layer/max(1, layers-1)
+        depth = layer/max(1, layers-1)
     elif distribution == "ald":
-        p = p_max if layer % 2 == 1 else 0.0
+        depth = 1.0 if layer % 2 == 1 else 0.0
     else:
-        p = p_max
+        depth = 1.0
     progress = step/max(1, horizon-1)
     if schedule == "decreasing":
-        p *= max(0.0, 1-progress)
+        p = p_final + (p_max-p_final)*max(0.0, 1-progress)
     elif schedule == "increasing":
-        p *= min(1.0, progress)
-    return p
+        p = p_max*min(1.0, progress)
+    else:
+        p = p_max
+    return p*depth
 
 
 class LayerPlan:
@@ -42,15 +46,15 @@ class LayerPlan:
 
 
 class LayerDropout:
-    def __init__(self, layers, p_max, distribution, schedule, horizon, seed):
-        self.layers, self.p_max, self.horizon = layers, p_max, horizon
+    def __init__(self, layers, p_max, distribution, schedule, horizon, seed, p_final=0.0):
+        self.layers, self.p_max, self.horizon, self.p_final = layers, p_max, horizon, p_final
         self.distribution, self.schedule = distribution, schedule
         self.rng = np.random.default_rng(seed)
         self.dropped = self.drawn = 0
 
     def plan(self, step):
         rates = [drop_rate(l, self.layers, step, self.horizon, self.p_max,
-                           self.distribution, self.schedule) for l in range(self.layers)]
+                           self.distribution, self.schedule, self.p_final) for l in range(self.layers)]
         keep = [bool(self.rng.random() >= p) for p in rates]
         self.dropped += keep.count(False)
         self.drawn += len(keep)

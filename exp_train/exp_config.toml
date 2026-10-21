@@ -3,7 +3,7 @@
 # One-off changes without editing: python exp.py train --set batch.micro_tokens=10240 --set run.name=try2
 
 [run]
-name = "700m-base"          # runs/<name>/ holds config, log, metrics, checkpoints; same name = resume
+name = "700m-v2"            # runs/<name>/ holds config, log, metrics, checkpoints; same name = resume
 seed = 1234
 runs_dir = "runs"
 cache_dir = "compile-cache" # compiled kernels; keep it to make restarts take ~1 min instead of ~12
@@ -20,16 +20,24 @@ val_tokens = 2_097_153
 
 [model]
 preset = "700m"             # 700m (32 layers x 1280, 716M dense) | 500m (32 x 1024) | 100m (20 x 512)
-ngram_params = 1_200_000_000        # hashed n-gram table in CPU RAM (BF16): 2.4 GB here
-layer_drop = 0.0            # 0.2 = up to 20% per block (rising with depth): +8.6% throughput, changes training
+ngram_params = 600_000_000          # hashed n-gram table in CPU RAM (BF16): 1.2 GB; shape in [model.shape]
+layer_drop = 0.25           # starting drop rate of the deepest block (rises with depth from 0 at block 1)
 layer_drop_dist = "ild"     # ild: rate rises with depth | uniform | ald: every other layer
-layer_drop_schedule = "decreasing"  # decreasing to 0 over the schedule (paper) | constant | increasing
+layer_drop_schedule = "decreasing"  # linear from layer_drop to layer_drop_final | constant | increasing
+layer_drop_final = 0.05     # rate reached at layer_drop_end and held afterwards
+layer_drop_end = "decay"    # "decay": when the learning-rate decay starts | a fraction of the schedule, e.g. 1.0
 depth_attn = "off"          # off | softmax | uniform: Depth-Attention, -0.8% throughput, unconfirmed gain
-delta_block = false         # Delta Block attention residuals: -14% throughput here, opt-in
+delta_block = true          # Delta Block attention residuals (sublayer inputs mix block-delta sources)
 delta_blocks = 4
 delta_variant = "repo"      # repo: published code | paper: true block deltas
 
-# [model.shape]             # optional: change the model itself (overrides the preset; see SETTINGS.md)
+[model.shape]               # overrides of the preset (see SETTINGS.md); quoted keys address the n-gram config
+"ngram.heads_per_order" = 4         # bigram + trigram x 4 hashes = 8 tables
+"ngram.dim" = 32                    # row width: 8 tables x 2,343,750 rows x 32 = 600M
+"ngram.inject_layers" = [1, 15]     # memory added before block 2 and before block 16 (one shared lookup)
+"ngram.canonical_tokens" = true     # hash normalized token ids (Engram tokenizer compression)
+"ngram.stochastic_round" = true     # unbiased rounding of the BF16 table updates
+# model itself (uncomment to change; preset values shown):
 # d_model = 1280
 # n_layers = 32
 # full_attn_every = 4       # every 4th layer is softmax attention, the rest Gated DeltaNet
@@ -39,7 +47,6 @@ delta_variant = "repo"      # repo: published code | paper: true block deltas
 # gdn_heads = 10            # gdn_heads * gdn_head_dim must equal d_model
 # gdn_head_dim = 128
 # ffn_dim = 3200            # multiple of 128
-# "ngram.dim" = 512
 
 [batch]
 micro_tokens = 16384        # tokens per forward pass; sets GPU memory (see SETTINGS.md table)

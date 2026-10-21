@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from ngram import ngram_hash
+from ngram_canon import canonical
 
 _detail_lock = threading.Lock()
 
@@ -44,6 +45,7 @@ def _indices(memory, ids, pos):
         memory._cpu_input_fallbacks = getattr(memory, "_cpu_input_fallbacks", 0) + 1
         cached = ids.detach().cpu(), pos.detach().cpu()
     cpu_ids, cpu_pos = cached
+    cpu_ids = canonical(memory, cpu_ids)  # identity unless a canonical-token map is attached
     _add(memory, "input_d2h_wall", time.perf_counter()-start)
     start = time.perf_counter()
     indices, masks = [], []
@@ -71,7 +73,9 @@ def enable_pinned(memory, staged=False, profile=False, gpu_table=False,
     memory._pin_profile = profile
     memory._sparse_update = sparse_update
     memory._update_threads = update_threads
-    memory._update_block = 4096  # 8 MB FP32 scratch: stays cache- and malloc-friendly
+    # ~8 MB FP32 scratch per block whatever the row width (4,096 rows at 512 wide): stays
+    # cache- and malloc-friendly, and narrow tables don't pay Python overhead per tiny block.
+    memory._update_block = max(4096, (1 << 21) // memory.cfg.dim)
     memory._process_group = process_group
     assert process_group is None or staged, "multi-rank n-gram sync is implemented for the staged path"
     if staged:
@@ -301,6 +305,37 @@ def _allreduce_accumulator(memory, block=1 << 16):
         rows.copy_(part)
 
 
+def _splitmix(*values):
+    z = 0x9E3779B97F4A7C15
+    for value in values:
+        z = (z ^ (int(value) & 0xFFFFFFFFFFFFFFFF)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+        z ^= z >> 31
+    return z
+
+
+def _sr_noise(memory, count, block_index):
+    """Uniform integers in [0, 2^16), one per element, from a fixed seeded buffer read at an offset
+    derived from (seed, update, block): no free-running generator, so a resumed run makes the
+    same rounding draws as the uninterrupted one."""
+    size = max(1 << 22, 2*count)
+    buffer = getattr(memory, "_sr_buffer", None)
+    if buffer is None or buffer.numel() < size:
+        generator = torch.Generator().manual_seed(int(getattr(memory, "_sr_seed", 0)) ^ 0x5EED)
+        buffer = memory._sr_buffer = torch.randint(0, 1 << 16, (size,), dtype=torch.int32, generator=generator)
+    offset = _splitmix(getattr(memory, "_sr_seed", 0), getattr(memory, "_sr_step", 0), block_index)         % (buffer.numel()-count)
+    return buffer[offset:offset+count]
+
+
+def stochastic_round_(target, value, noise):
+    """target (BF16) <- value (FP32) rounded stochastically: add uniform noise to the 16 bits BF16
+    drops, then truncate. Unbiased; values already representable in BF16 are unchanged. Overwrites
+    value (contiguous FP32)."""
+    bits = value.view(torch.int32)
+    bits.add_(noise.view(bits.shape))
+    bits.bitwise_and_(-65536)
+    target.copy_(value)  # exact: the low 16 bits are zero
+
+
 def _block_update(memory, lr_mult):
     """Same arithmetic as _row_update, over contiguous row blocks with a touched mask.
 
@@ -315,7 +350,9 @@ def _block_update(memory, lr_mult):
         # Reused every step: fresh multi-MB temporaries are mmapped and faulted in each time.
         scratch = memory._update_scratch = dict(
             work=torch.empty(block, cfg.dim), low=torch.empty(block, cfg.dim, dtype=table.dtype),
-            mean=torch.empty(block), fresh=torch.empty(block), denom=torch.empty(block))
+            mean=torch.empty(block), fresh=torch.empty(block), denom=torch.empty(block),
+            high=torch.empty(block, cfg.dim))
+    stochastic = getattr(cfg, "stochastic_round", False) and table.dtype == torch.bfloat16
     for first in range(0, table.shape[0], block):
         mask = memory._host_touched[first:first+block]
         count = int(mask.sum())
@@ -334,7 +371,12 @@ def _block_update(memory, lr_mult):
             # any nonfinite value that reached a masked-out accumulator entry.
             v.copy_(torch.where(mask, fresh, v))
             work.masked_fill_(~mask.unsqueeze(1), 0.0)
-            table[first:first+block].add_(low.copy_(work))
+            if stochastic:
+                high = scratch["high"][:n]
+                high.copy_(table[first:first+block]).add_(work)
+                stochastic_round_(table[first:first+block], high, _sr_noise(memory, high.numel(), first // block))
+            else:
+                table[first:first+block].add_(low.copy_(work))
             g.zero_()
             mask.zero_()
         elif g.any():
@@ -347,7 +389,7 @@ def _row_update(memory, lr_mult):
     start = time.perf_counter()
     uniq = memory._host_touched.nonzero().flatten()
     cfg = memory.cfg
-    for rows in uniq.split(16384):
+    for chunk, rows in enumerate(uniq.split(16384)):
         g = memory._host_grad[rows]
         if memory.table.device.type == "cuda":
             g = g.pin_memory().to(memory.table.device, non_blocking=True)
@@ -355,7 +397,14 @@ def _row_update(memory, lr_mult):
         v = memory.row_v[rows].mul_(cfg.beta2).add_(g.square().mean(1), alpha=1-cfg.beta2)
         memory.row_v[rows] = v
         upd = g/(v.sqrt()+cfg.eps).unsqueeze(1)
-        memory.table.index_add_(0, rows, (upd*(-cfg.lr*lr_mult)).to(memory.table.dtype))
+        if getattr(cfg, "stochastic_round", False) and memory.table.dtype == torch.bfloat16:
+            value = (memory.table[rows].float() + upd*(-cfg.lr*lr_mult)).contiguous()
+            noise = _sr_noise(memory, value.numel(), chunk).to(value.device)
+            rounded = torch.empty_like(value, dtype=torch.bfloat16)
+            stochastic_round_(rounded, value, noise)
+            memory.table[rows] = rounded
+        else:
+            memory.table.index_add_(0, rows, (upd*(-cfg.lr*lr_mult)).to(memory.table.dtype))
     _add(memory, "cpu_rmsprop", time.perf_counter()-start)
     start = time.perf_counter()
     memory._host_grad.zero_()
@@ -364,25 +413,41 @@ def _row_update(memory, lr_mult):
     return uniq.numel()
 
 
-def check_pinned(gpu_table=False):
+def check_pinned(gpu_table=False, canon=False, stochastic=False):
+    """Pinned/staged paths against the GPU reference NgramMemory.
+
+    canon: a synthetic canonical-token map on both sides (lookups must stay identical).
+    stochastic: candidates round their BF16 table writes stochastically, the reference to nearest,
+    so tables may differ by one BF16 ulp per update (inside the tolerance)."""
     import copy
     from config import NgramConfig
     from ngram import NgramMemory
     from ram_ngram import enable_ram_ngram
+    import ngram_canon
     torch.set_num_threads(4)
     torch.manual_seed(792)
     reference = NgramMemory(NgramConfig(dim=16, total_params=65536, table_dtype="bfloat16"), 32, 1).cuda().train()
+    if canon:
+        folded = torch.arange(60800)
+        folded[1::3] -= 1  # ids 3k+1 hash as 3k; idempotent
+        ngram_canon.attach(reference, folded)
     modes = ("rows",) if gpu_table else ("rows", "blocks")
     candidates, collects = {}, {}
     for mode in modes:
         candidates[mode] = copy.deepcopy(reference)
+        if stochastic:
+            candidates[mode].cfg = copy.deepcopy(reference.cfg)
+            candidates[mode].cfg.stochastic_round = True
+            candidates[mode]._sr_seed = 11
         if not gpu_table:
             enable_ram_ngram(candidates[mode])
         collects[mode] = enable_pinned(candidates[mode], staged=True, gpu_table=gpu_table,
                                        sparse_update=mode, update_threads=2)
         # Several blocks, including a partial last block, on the 4,096-row test table.
         candidates[mode]._update_block = 1000
-    for _ in range(2):
+    for step in range(2):
+        for candidate in candidates.values():
+            candidate._sr_step = step
         for micro in range(4):
             ids = torch.randint(0, 60800, (193,), device="cuda")
             pos = torch.arange(193, device="cuda") % 37
@@ -397,13 +462,15 @@ def check_pinned(gpu_table=False):
                 (b*weight/4).sum().backward()
                 collects[mode](candidate)
         touched = reference.sparse_step()
+        # Stochastic rounding may land one BF16 ulp away from round-to-nearest on each update.
+        tol = dict(rtol=0.008, atol=0.001) if stochastic else dict(rtol=0.004, atol=0.0005)
         for candidate in candidates.values():
             assert candidate.sparse_step() == touched
-            torch.testing.assert_close(reference.table.cpu(), candidate.table.cpu(), rtol=0.004, atol=0.0005)
+            torch.testing.assert_close(reference.table.cpu(), candidate.table.cpu(), **tol)
             torch.testing.assert_close(reference.row_v.cpu(), candidate.row_v.cpu(), rtol=1e-4, atol=1e-6)
             assert not candidate._host_touched.any() and not candidate._host_grad.any()
             assert candidate._cpu_next is None
-        if len(candidates) == 2:
+        if len(candidates) == 2 and not stochastic:
             # Same formula in a different layout. Vectorized and scalar tails may round
             # add_(alpha=...) differently, so row_v may move by one FP32 ulp.
             assert torch.equal(candidates["rows"].table, candidates["blocks"].table)
@@ -413,7 +480,40 @@ def check_pinned(gpu_table=False):
         assert candidate._cpu_input_fallbacks == 2
         candidate._pin_worker.shutdown()
     print("PINNED_PARITY: two updates, buffer reuse and CPU-input handoff passed; GPU table:",
-          gpu_table, "updates:", modes, "block table bit-identical:", len(modes) == 2, flush=True)
+          gpu_table, "updates:", modes, "canonical ids:", canon, "stochastic rounding:", stochastic,
+          "block table bit-identical:", len(modes) == 2 and not stochastic, flush=True)
+
+
+def check_stochastic_round():
+    """Unbiased, exact for representable values, deterministic for (seed, step, block)."""
+    from types import SimpleNamespace
+    memory = SimpleNamespace(_sr_seed=3, _sr_step=0)
+    count = 1 << 16
+    # 1 + 1e-3: BF16 spacing at 1.0 is 2^-7, so round-to-nearest would always give exactly 1.0.
+    target = torch.full((count,), 1.0 + 1e-3)
+    draws = []
+    for step in range(64):
+        memory._sr_step = step
+        out = torch.empty(count, dtype=torch.bfloat16)
+        stochastic_round_(out, target.clone(), _sr_noise(memory, count, 0))
+        draws.append(out.float())
+    mean = torch.stack(draws).mean()
+    assert abs(float(mean) - (1.0 + 1e-3)) < 2e-5, float(mean)
+    assert set(torch.stack(draws).unique().tolist()) == {1.0, 1.0 + 2**-7}
+    exact = torch.randn(count).bfloat16()
+    out = torch.empty_like(exact)
+    stochastic_round_(out, exact.float(), _sr_noise(memory, count, 5))
+    assert torch.equal(out, exact), "representable values must not move"
+    negative = torch.full((count,), -(1.0 + 1e-3))
+    out = torch.empty(count, dtype=torch.bfloat16)
+    stochastic_round_(out, negative, _sr_noise(memory, count, 9))
+    assert abs(float(out.float().mean()) + 1.0 + 1e-3) < 2e-4, float(out.float().mean())
+    memory._sr_step = 7
+    a, b = _sr_noise(memory, count, 2).clone(), _sr_noise(memory, count, 2).clone()
+    c = _sr_noise(memory, count, 3)
+    assert torch.equal(a, b) and not torch.equal(a, c)
+    print("STOCHASTIC_ROUND: unbiased (mean", round(float(mean), 6), "for 1.001), representable values "
+          "unchanged, negative values unbiased, noise deterministic per (seed, step, block)", flush=True)
 
 
 def _distributed_worker(rank, world, port, mode):
@@ -480,7 +580,11 @@ def check_pinned_distributed(world=2, mode="blocks"):
 
 
 if __name__ == "__main__":
+    check_stochastic_round()
     check_pinned()
     check_pinned(gpu_table=True)
+    check_pinned(canon=True)
+    check_pinned(stochastic=True)
+    check_pinned(gpu_table=True, stochastic=True)
     for mode in ("rows", "blocks"):
         check_pinned_distributed(mode=mode)

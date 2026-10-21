@@ -31,7 +31,7 @@ CODE = HERE / "code"
 # Allowed keys per section (typos are errors, not silently ignored settings).
 TRAINER_SECTIONS = {
     "model": {"preset", "ngram_params", "layer_drop", "layer_drop_dist", "layer_drop_schedule",
-              "depth_attn", "delta_block", "delta_blocks", "delta_variant"},
+              "layer_drop_final", "layer_drop_end", "depth_attn", "delta_block", "delta_blocks", "delta_variant"},
     "batch": {"micro_tokens", "grad_accum", "seq_len"},
     "schedule": {"steps", "warmup_steps", "decay_frac", "min_lr_frac", "stop_at", "max_minutes"},
     "optimizer": {"optimizer", "dion_lr", "dion_fraction", "dion_mu", "dion_weight_decay", "scalar_lr",
@@ -51,25 +51,43 @@ STORE_TRUE = {"delta_block"}                                                # --
 ZERO_MEANS_DEFAULT = {"update_threads", "gpu_mem_cap_gib"}                  # 0: let the trainer decide
 SHAPE_KEYS = {"d_model", "n_layers", "full_attn_every", "n_heads", "n_kv_heads", "head_dim", "gdn_heads",
               "gdn_head_dim", "ffn_dim", "rope_theta", "ngram.dim", "ngram.inject_layers", "ngram.orders",
-              "ngram.heads_per_order", "ngram.lr", "ngram.beta2"}
+              "ngram.heads_per_order", "ngram.lr", "ngram.beta2", "ngram.canonical_tokens",
+              "ngram.stochastic_round"}
 
 # Measured on one A100-SXM4-80GB, 700m preset, ~786k-token updates, current stack (see RESULTS.md).
 MEASURED = {10240: (26379, 30.6), 16384: (27504, 42.7), 20480: (27502, 51.2), 24576: (28145, 58.1)}
+
+
+def split_key(key):
+    """'model.shape."ngram.dim"' -> ['model', 'shape', 'ngram.dim'] (quoted parts may contain dots)."""
+    parts, current, quoted = [], "", False
+    for ch in key:
+        if ch == '"':
+            quoted = not quoted
+        elif ch == "." and not quoted:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    return parts + [current]
 
 
 def load_config(path, sets):
     config = tomllib.loads(Path(path).read_text())
     for item in sets:
         key, value = item.split("=", 1)
-        section, _, name = key.rpartition(".")
+        *sections, name = split_key(key)
         try:
             value = tomllib.loads(f"v = {value}")["v"]
         except tomllib.TOMLDecodeError:
             pass                                    # bare strings: --set run.name=small
         node = config
-        for part in section.split("."):
+        for part in sections:
             node = node.setdefault(part, {})
         node[name] = value
+    model = config.get("model", {})
+    if model.get("layer_drop_end") == "decay":     # reach layer_drop_final when the LR decay starts
+        model["layer_drop_end"] = round(1 - config.get("schedule", {}).get("decay_frac", 0.2), 6)
     allowed = {**TRAINER_SECTIONS, **OTHER_SECTIONS}
     for section, values in config.items():
         if section == "model" and "shape" in values:

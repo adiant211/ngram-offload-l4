@@ -450,6 +450,10 @@ def parse():
     p.add_argument("--layer-drop-dist", choices=("ild", "uniform", "ald"), default="ild")
     p.add_argument("--layer-drop-schedule", choices=("decreasing", "constant", "increasing"),
                    default="decreasing")
+    p.add_argument("--layer-drop-final", type=float, default=0.0,
+                   help="decreasing schedule: rate reached at --layer-drop-end and held after it")
+    p.add_argument("--layer-drop-end", type=float, default=1.0,
+                   help="fraction of the schedule at which the decreasing rate reaches --layer-drop-final")
     p.add_argument("--depth-attn", choices=("off", "softmax", "uniform"), default="off")
     p.add_argument("--delta-block", action="store_true",
                    help="Delta Block attention residuals (Luo et al.): sublayer inputs mix block-delta sources")
@@ -544,6 +548,16 @@ def main():
         args.update_threads = max(1, os.cpu_count() // int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
     from ram_ngram import enable_ram_ngram
     from pinned_ngram import attach_cpu_inputs, enable_pinned
+    canon_sha = None
+    if getattr(c.ngram, "canonical_tokens", False):
+        # Engram-style tokenizer compression, for n-gram hashing only (ngram_canon.py).
+        import ngram_canon
+        canon = ngram_canon.build_map(args.tokenizer)
+        ngram_canon.attach(model.ngram, canon)
+        canon_sha = ngram_canon.checksum(canon)
+        log("NGRAM_CANON", json.dumps(dict(vocab=len(canon), distinct=int(torch.unique(canon).numel()),
+                                           sha256=canon_sha[:16])))
+    model.ngram._sr_seed = args.seed  # stochastic rounding draws depend on (seed, update, block)
     enable_ram_ngram(model.ngram)
     collect = enable_pinned(model.ngram, staged=True, sparse_update="blocks",
                             update_threads=args.update_threads, process_group=group)
@@ -567,8 +581,11 @@ def main():
         import layer_dropout
         layer_dropout.install(model, args.compile_mode)
         if args.layer_drop > 0:
+            # "decreasing" reaches layer_drop_final at layer_drop_end of the schedule, then holds it.
+            horizon = max(1, round(args.steps * args.layer_drop_end))
             layer_drop = layer_dropout.LayerDropout(len(model.blocks), args.layer_drop, args.layer_drop_dist,
-                                                    args.layer_drop_schedule, args.steps, args.seed)
+                                                    args.layer_drop_schedule, horizon, args.seed,
+                                                    p_final=args.layer_drop_final)
     if args.delta_block:
         # After layer dropout: its forward is replaced by one that also honours layer plans.
         import delta_block
@@ -589,6 +606,7 @@ def main():
         try:
             meta = json.loads((directory / "meta.json").read_text())
             assert meta["world_size"] == world, f"saved with {meta['world_size']} ranks, running {world}"
+            assert meta.get("ngram_canon_sha256") == canon_sha, "canonical-token map differs from the checkpoint's"
             assert meta["preset"] == args.preset and meta["ngram_params"] == args.ngram_params
             assert meta.get("model_config") in (None, json.loads(json.dumps(asdict(c)))), \
                 "the model configuration differs from the checkpoint's"
@@ -675,7 +693,7 @@ def main():
             files["model"] = {k: v.detach().to("cpu", copy=True)
                               for k, v in model.state_dict().items() if k not in NGRAM_KEYS}
             files["ngram"] = dict(table=model.ngram.table.clone(), row_v=model.ngram.row_v.clone())
-        meta = dict(step=step, tokens_seen=tokens_seen, train_seconds=train_seconds,
+        meta = dict(step=step, tokens_seen=tokens_seen, train_seconds=train_seconds, ngram_canon_sha256=canon_sha,
                     skipped_updates=skipped, world_size=world, preset=args.preset,
                     ngram_params=args.ngram_params, args=vars(args), model_config=asdict(c),
                     saved_at=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -706,6 +724,8 @@ def main():
             model._layer_plan = None
             return float(total[0] / total[1])
         result = dict(eval_loss=held_out_loss())
+        # Table scale: BF16 spacing grows with it (round-to-nearest drops updates < half a spacing).
+        result["ngram_table_rms"] = float(torch.sqrt(torch.mean(model.ngram.table.float().square())))
         if args.eval_exit_at:
             from layer_dropout import exit_plan
             result["eval_loss_early_exit"] = held_out_loss(exit_plan(len(model.blocks), args.eval_exit_at))
@@ -771,6 +791,7 @@ def main():
                 resync_replicas(model, optimizer)
             torch.cuda.synchronize()
             sparse_begin = time.perf_counter()
+            model.ngram._sr_step = step
             rows = model.ngram.sparse_step(mult)
             dense_seconds, sparse_seconds = sparse_begin - dense_begin, time.perf_counter() - sparse_begin
         torch.cuda.synchronize()
