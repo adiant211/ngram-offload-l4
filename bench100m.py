@@ -6,10 +6,12 @@ Timing includes forward/backward, clipping, dense optimizer and sparse updates;
 excludes sample preparation, warmup, compilation and evaluation. Batches are GPU resident.
 """
 import argparse
+import contextlib
 import gc
 import inspect
 import json
 import math
+import os
 import resource
 import time
 from dataclasses import asdict
@@ -52,6 +54,10 @@ def native_attention(self, x, batch, force_ref=False):
     q = self.q_norm(q.view(n, c.n_heads, c.head_dim))
     k = self.k_norm(k.view(n, c.n_kv_heads, c.head_dim))
     v = v.view(n, c.n_kv_heads, c.head_dim)
+    if hasattr(self, "_depth_index"):
+        # Same-position RoPE rotations cancel in q.k, so depth scores use pre-RoPE states.
+        from depth_attention import depth_mix
+        v = depth_mix(self, q, k, v)
     q = stack.rope(q, batch["pos"], c.rope_theta)
     k = stack.rope(k, batch["pos"], c.rope_theta)
     # PyTorch 2.11 uses the right window boundary to express causality.
@@ -109,16 +115,21 @@ def optimize(model, args):
     import types
     assert args.compile != "tail" or args.ckpt == "none", "tail compile has no checkpointed variant"
     model.full_ckpt = False
+    # "fused" merges the weights into one Parameter; "concat" keeps the original
+    # Parameters (as matrix optimizers and checkpoints expect) and fuses only the GEMM.
+    pack = pack_linear
+    if args.pack and getattr(args, "pack_mode", "fused") == "concat":
+        from dion_optim import concat_projections as pack
     for block in model.blocks:
         block.ckpt_mlp = args.ckpt == "mlp"
         mixer = block.mixer
         if args.pack:
             if block.is_attn:
-                pack_linear(mixer, ("q_proj", "k_proj", "v_proj", "gate_proj"))
+                pack(mixer, ("q_proj", "k_proj", "v_proj", "gate_proj"))
             else:
-                pack_linear(mixer, ("q_proj", "k_proj", "v_proj", "a_proj", "b_proj", "g_proj"))
+                pack(mixer, ("q_proj", "k_proj", "v_proj", "a_proj", "b_proj", "g_proj"))
                 mixer.forward = types.MethodType(packed_gdn, mixer)
-            pack_linear(block.mlp, ("w_gate", "w_up"))
+            pack(block.mlp, ("w_gate", "w_up"))
             block.mlp.forward = types.MethodType(packed_mlp, block.mlp)
         if block.is_attn and args.attn == "native":
             mixer.forward = types.MethodType(native_attention, mixer)
@@ -241,6 +252,36 @@ def main():
                         help="tail also folds both gated residual adds into the compiled MLP region")
     parser.add_argument("--ckpt", choices=("none", "mlp"), default="none")
     parser.add_argument("--pack", action="store_true")
+    parser.add_argument("--pack-mode", choices=("fused", "concat"), default="fused",
+                        help="concat keeps separate Parameters and fuses only the GEMM (needed by Dion3)")
+    parser.add_argument("--optimizer", choices=("adamw", "dion3"), default="adamw",
+                        help="dense optimizer; the n-gram table always uses its sparse row RMSprop")
+    parser.add_argument("--dion-lr", type=float, default=0.02)
+    parser.add_argument("--dion-fraction", type=float, default=0.5)
+    parser.add_argument("--dion-mu", type=float, default=0.95)
+    parser.add_argument("--dion-weight-decay", type=float, default=0.01)
+    parser.add_argument("--dion-triton", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--scalar-lr", type=float, default=3e-3,
+                        help="AdamW lr for embeddings, norms and scalars under --optimizer dion3")
+    parser.add_argument("--dist-backend", choices=("nccl", "gloo"), default="nccl",
+                        help="under torchrun; gloo lets several ranks share one GPU for testing")
+    parser.add_argument("--depth-attn", choices=("off", "softmax", "uniform"), default="off",
+                        help="Depth-Attention value mixing across the gated-attention layers")
+    parser.add_argument("--layer-drop", type=float, default=0.0,
+                        help="max layer-dropout rate p_max (0 disables)")
+    parser.add_argument("--layer-drop-dist", choices=("ild", "uniform", "ald"), default="ild")
+    parser.add_argument("--layer-drop-schedule", choices=("decreasing", "constant", "increasing"),
+                        default="decreasing")
+    parser.add_argument("--layer-drop-horizon", type=int, default=0,
+                        help="steps over which the schedule runs; default warmup + steps")
+    parser.add_argument("--eval-exit-at", type=int, default=0,
+                        help="also evaluate with only the first N blocks (early exit)")
+    parser.add_argument("--eval-data", default=None,
+                        help="held-out uint16 token file; reports mean loss after training")
+    parser.add_argument("--eval-tokens", type=int, default=1048576)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--checksums", action="store_true",
+                        help="report FP64 sums of dense parameters and the n-gram table after training")
     parser.add_argument("--gdn-head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--output", default="results100m.jsonl")
@@ -249,8 +290,19 @@ def main():
     assert not args.pack or args.attn == "native"
     assert args.steps > 0 and args.warmup > 0 and args.grad_accum > 0
     assert not (args.host_accum and args.cuda_accum)
+    assert args.optimizer != "dion3" or not args.pack or args.pack_mode == "concat", \
+        "Dion3 orthogonalizes whole Parameters: use --pack-mode concat to keep q/k/v/gate separate"
+    distributed = "RANK" in os.environ
+    rank, world = 0, 1
+    if distributed:
+        import torch.distributed as dist
+        dist.init_process_group(args.dist_backend)
+        rank, world = dist.get_rank(), dist.get_world_size()
+        # With gloo, several test ranks may share one GPU; NCCL needs one GPU per rank.
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)) % torch.cuda.device_count())
+    log = (lambda *a: print(*a, flush=True)) if rank == 0 else (lambda *a: None)
     torch.set_num_threads(4)
-    torch.manual_seed(1234)
+    torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     assert stack.USE_FLA, "FLA required; do not benchmark a sequential reference GDN"
     if args.check:
@@ -271,11 +323,21 @@ def main():
     eos = tok.token_to_id("<eos>")
     raw = np.memmap(args.data, mode="r", dtype=np.uint16)
     count = args.steps + args.warmup
-    batches = [build_batch(raw[(i*args.tokens) % (len(raw)-args.tokens):][:args.tokens+1], eos, args.seq_len)
-               for i in range(count * args.grad_accum)]
-    torch.manual_seed(1234)
+    # Global microbatch g = (step*world + rank)*accum + micro: one rank with accumulation
+    # A*W sees the same data per update as W ranks with accumulation A each.
+    window = lambda g: raw[(g*args.tokens) % (len(raw)-args.tokens):][:args.tokens+1]
+    local = [(i*world + rank)*args.grad_accum + m for i in range(count) for m in range(args.grad_accum)]
+    batches = [build_batch(window(g), eos, args.seq_len) for g in local]
+    # Supervised targets per update across all ranks, from the fixture itself (no collective):
+    # build_batch ignores exactly the targets whose input token is EOS.
+    per_update = world*args.grad_accum
+    global_valid = [sum(args.tokens - int((window(g)[:-1] == eos).sum())
+                        for g in range(i*per_update, (i+1)*per_update)) for i in range(count)]
+    torch.manual_seed(args.seed)
     with torch.device("cuda"):
         model = stack.HybridLM(c)
+    if distributed:
+        model.ngram.init_sync()  # rank 0's table everywhere, before it moves to RAM
     if model.loss_fn is not None:
         model._loss = MethodType(flat_fused_loss, model)
     if args.fast_ce:
@@ -287,6 +349,11 @@ def main():
     staged = args.host_accum or (args.ngram_device == "cpu" and args.ram_mode == "staged")
     assert args.sparse_update == "rows" or (staged and not args.host_accum), \
         "--sparse-update blocks applies to --ram-mode staged with the RAM table"
+    # Replicas stay identical only where the sparse step reduces gradients across ranks:
+    # the staged paths here, or the original GPU table (its sparse_step all-gathers rows).
+    assert not distributed or staged or (args.ngram_device == "cuda" and not args.cuda_accum), \
+        "multi-GPU needs --ram-mode staged, --host-accum, or the plain GPU table"
+    group = dist.group.WORLD if distributed else None
     if args.ngram_device == "cpu":
         from ram_ngram import enable_ram_ngram, collect_ram_grads
         enable_ram_ngram(model.ngram)
@@ -294,7 +361,7 @@ def main():
             from pinned_ngram import enable_pinned
             collect_ram_grads = enable_pinned(model.ngram, staged=staged, profile=args.profile_ram,
                                               sparse_update=args.sparse_update,
-                                              update_threads=args.update_threads)
+                                              update_threads=args.update_threads, process_group=group)
         gc.collect()
         torch.cuda.empty_cache()
     if args.cuda_accum:
@@ -303,10 +370,11 @@ def main():
     if args.host_accum:
         from pinned_ngram import enable_pinned
         collect_ram_grads = enable_pinned(model.ngram, staged=True, gpu_table=True,
-                                          update_threads=args.update_threads)
+                                          update_threads=args.update_threads, process_group=group)
     if staged:
         from pinned_ngram import attach_cpu_inputs
-        attach_cpu_inputs(model)
+        if not distributed:  # under DDP the hook goes on the wrapper, below
+            attach_cpu_inputs(model)
     model.train()
     report = model.param_report()
     print("MODEL", json.dumps(report), flush=True)
@@ -321,6 +389,18 @@ def main():
     from optim800k import apply_optimizations
     apply_optimizations(model, args)
     optimize(model, args)
+    if args.depth_attn != "off":
+        assert args.attn == "native", "Depth-Attention is implemented in the native attention path"
+        from depth_attention import enable_depth_attention
+        log("DEPTH_ATTENTION", json.dumps(enable_depth_attention(model, args.depth_attn)))
+    layer_drop = None
+    if args.layer_drop > 0 or args.eval_exit_at:
+        import layer_dropout
+        layer_dropout.install(model, args.compile_mode)
+        if args.layer_drop > 0:
+            layer_drop = layer_dropout.LayerDropout(
+                len(model.blocks), args.layer_drop, args.layer_drop_dist, args.layer_drop_schedule,
+                args.layer_drop_horizon or count, args.seed)
     print("PLACEMENT", dict(table=str(model.ngram.table.device), row_state=str(model.ngram.row_v.device),
                             table_bytes=model.ngram.table.numel()*model.ngram.table.element_size(),
                             checkpointing=any(b.ckpt_mlp for b in model.blocks) or model.full_ckpt,
@@ -331,8 +411,23 @@ def main():
         assert math.isfinite(after) and abs(after-before)/max(1., abs(before)) < 0.01, (before, after)
         print("PACKED_MODEL_LOSS_PARITY", before, after, flush=True)
     assert model.param_report() == report
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95),
-                                 weight_decay=0.01, fused=True)
+    train_model = model
+    if distributed:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        # The n-gram table and row state are host buffers kept in sync by the sparse step.
+        DDP._set_params_and_buffers_to_ignore_for_model(model, ["ngram.table", "ngram.row_v"])
+        train_model = DDP(model, device_ids=[torch.cuda.current_device()], broadcast_buffers=False,
+                          gradient_as_bucket_view=True, bucket_cap_mb=64)
+        if staged:  # before DDP copies the batch's CPU token tensors to the GPU
+            from pinned_ngram import attach_cpu_inputs
+            attach_cpu_inputs(train_model, model.ngram)
+    if args.optimizer == "dion3":
+        from dion_optim import build_dion3
+        optimizer, groups = build_dion3(model, args, train_model.process_group if distributed else None)
+        log("OPTIMIZER", json.dumps(dict(name="dion3", world=world, **groups)))
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95),
+                                     weight_decay=0.01, fused=True)
     losses, seconds, touched_rows = [], [], []
     sparse_seconds, dense_seconds, forward_backward_seconds = [], [], []
     begin_wall = None
@@ -349,24 +444,38 @@ def main():
         events[0].record()
         optimizer.zero_grad(set_to_none=True)
         values = []
-        step_batches = batches[i*args.grad_accum:(i+1)*args.grad_accum]
-        step_valid = sum(b["valid_tokens"] for b in step_batches)
+        step_valid = global_valid[i]
         assert step_valid > 0
         for micro in range(args.grad_accum):
             batch = batches[i * args.grad_accum + micro]
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss = model(batch)
-            weight = batch["valid_tokens"]/step_valid if args.token_weighted else 1/args.grad_accum
-            value = loss.detach() if args.defer_loss_sync else float(loss.detach())
-            if not args.defer_loss_sync and not math.isfinite(value):
-                raise RuntimeError(f"Nonfinite loss at step {i}, micro {micro}: {value}")
-            (loss * weight).backward()
+            # DDP all-reduces only on the last microbatch of the update.
+            sync = not distributed or micro == args.grad_accum-1
+            if layer_drop is not None:
+                # Under DDP the synchronizing microbatch runs every block, so no
+                # parameter is unused in the backward that triggers the reduction.
+                model._layer_plan = None if distributed and sync else layer_drop.plan(i)
+            with contextlib.nullcontext() if sync else train_model.no_sync():
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss = train_model(batch)
+                # DDP averages over ranks, so scale by world: the result is the global token mean.
+                weight = (batch["valid_tokens"]/step_valid*world if args.token_weighted
+                          else 1/args.grad_accum)
+                value = loss.detach() if args.defer_loss_sync else float(loss.detach())
+                if not args.defer_loss_sync and not math.isfinite(value):
+                    raise RuntimeError(f"Nonfinite loss at step {i}, micro {micro}: {value}")
+                (loss * weight).backward()
             if args.cuda_accum:
                 collect_cuda_grads(model.ngram)
             if args.ngram_device == "cpu" or args.host_accum:
                 collect_ram_grads(model.ngram)
             values.append(value * weight)
-        value = float(torch.stack(values).sum()) if args.defer_loss_sync else sum(values)
+        if distributed:
+            total = (torch.stack(values).sum() if args.defer_loss_sync
+                     else torch.tensor(sum(values), device="cuda"))
+            dist.all_reduce(total)
+            value = float(total)/world
+        else:
+            value = float(torch.stack(values).sum()) if args.defer_loss_sync else sum(values)
         if not math.isfinite(value):
             raise RuntimeError(f"Nonfinite accumulated loss at step {i}: {value}")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True, foreach=True)
@@ -384,17 +493,50 @@ def main():
             losses.append(value)
             touched_rows.append(touched)
         if i in (0, args.warmup-1, count-1):
-            print("STEP", i+1, "loss", value, "rows", touched, flush=True)
+            log("STEP", i+1, "loss", value, "rows", touched)
     wall = time.perf_counter() - begin_wall
     assert torch.isfinite(model.ngram.row_v).all(), "Nonfinite sparse optimizer state"
+    if world == 1:
+        assert global_valid == [sum(b["valid_tokens"] for b in batches[j*args.grad_accum:(j+1)*args.grad_accum])
+                                for j in range(count)], "fixture-derived token counts disagree with batches"
+    evaluation = {}
+    if layer_drop is not None:
+        model._layer_plan = None
+        evaluation.update(layer_drop.report())
+    if args.eval_data:
+        # Token-weighted mean loss over a held-out file, after timing. Train mode is kept
+        # (no dropout here) so compiled regions are reused; no_grad skips n-gram gradients.
+        held_out = np.memmap(args.eval_data, mode="r", dtype=np.uint16)
+        windows = min(args.eval_tokens, len(held_out)-1)//args.tokens
+        eval_batches = [build_batch(held_out[w*args.tokens:][:args.tokens+1], eos, args.seq_len)
+                        for w in range(windows)]
+
+        def held_out_loss(plan=None):
+            model._layer_plan = plan
+            total, supervised = 0.0, 0
+            with torch.no_grad():
+                for batch in eval_batches:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        total += float(model(batch))*batch["valid_tokens"]
+                    supervised += batch["valid_tokens"]
+            model._layer_plan = None
+            return total/supervised, supervised
+        loss, supervised = held_out_loss()
+        evaluation.update(eval_loss=loss, eval_tokens_used=windows*args.tokens,
+                          eval_supervised_tokens=supervised)
+        if args.eval_exit_at:
+            from layer_dropout import exit_plan
+            evaluation["eval_loss_early_exit"] = held_out_loss(
+                exit_plan(len(model.blocks), args.eval_exit_at))[0]
+        log("EVAL", json.dumps(evaluation))
+    update_tokens = args.tokens*args.grad_accum*world
     result = dict(
         **vars(args), **report, gpu=torch.cuda.get_device_name(0), torch=torch.__version__,
-        effective_batch_tokens=args.tokens*args.grad_accum,
-        data_token_count=len(raw), fixture_reused=args.tokens*args.grad_accum*count > len(raw)-1,
-        min_supervised_tokens_per_update=min(sum(b["valid_tokens"] for b in
-            batches[j*args.grad_accum:(j+1)*args.grad_accum]) for j in range(count)),
-        tokens_per_second=args.tokens*args.grad_accum*args.steps/wall,
-        gpu_tokens_per_second=args.tokens*args.grad_accum*args.steps/sum(seconds), measured_wall_seconds=wall,
+        world_size=world, effective_batch_tokens=update_tokens,
+        data_token_count=len(raw), fixture_reused=update_tokens*count > len(raw)-1,
+        min_supervised_tokens_per_update=min(global_valid),
+        tokens_per_second=update_tokens*args.steps/wall,
+        gpu_tokens_per_second=update_tokens*args.steps/sum(seconds), measured_wall_seconds=wall,
         median_step_ms=float(np.median(seconds)*1000),
         forward_backward_clip_ms=float(np.mean(forward_backward_seconds)*1000),
         dense_optimizer_ms=float(np.mean(dense_seconds)*1000),
@@ -410,7 +552,12 @@ def main():
         maximum_document_tokens=max(b["max_len"] for b in batches),
         checkpointing_enabled=any(b.ckpt_mlp for b in model.blocks) or model.full_ckpt,
         host_peak_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/2**20,
+        losses=losses,
+        dynamo_unique_graphs=__import__("torch._dynamo.utils").\
+            _dynamo.utils.counters["stats"]["unique_graphs"],
     )
+    # Merged, not keyword-expanded: an evaluation key may share a name with a CLI flag.
+    result.update(evaluation)
     if args.ngram_device == "cpu" or args.host_accum:
         result["ram_operation_wall_ms_per_step"] = {
             key: value/args.steps*1000 for key, value in model.ngram._ram_profile.items()}
@@ -420,10 +567,25 @@ def main():
     if staged:
         # Nonzero means some lookups hashed via a synchronizing GPU-to-CPU copy.
         result["cpu_input_fallbacks"] = model.ngram._cpu_input_fallbacks
-    with open(args.output, "a") as handle:
-        handle.write(json.dumps(result) + "\n")
-    Path("config100m.json").write_text(json.dumps(asdict(c), indent=2))
-    print("RESULT", json.dumps(result), flush=True)
+    if args.checksums:
+        with torch.no_grad():
+            result["dense_checksum"] = float(sum(p.detach().double().sum() for p in model.parameters()))
+            result["table_checksum"] = float(torch.sum(model.ngram.table, dtype=torch.float64))
+            result["row_state_checksum"] = float(torch.sum(model.ngram.row_v, dtype=torch.float64))
+        if distributed:  # replicas must agree; report the spread across ranks
+            sums = torch.tensor([result["dense_checksum"], result["table_checksum"]],
+                                dtype=torch.float64, device="cuda")
+            spread = sums.clone()
+            dist.all_reduce(sums, op=dist.ReduceOp.MAX)
+            dist.all_reduce(spread, op=dist.ReduceOp.MIN)
+            result["checksum_rank_spread"] = (sums-spread).tolist()
+    if rank == 0:
+        with open(args.output, "a") as handle:
+            handle.write(json.dumps(result) + "\n")
+        Path("config100m.json").write_text(json.dumps(asdict(c), indent=2))
+    log("RESULT", json.dumps(result))
+    if distributed:
+        dist.destroy_process_group()
     if args.profile_kernels:
         profile_kernels(model, batches, args, collect_ram_grads if staged or args.ngram_device == "cpu"
                         else None, collect_cuda_grads if args.cuda_accum else None)

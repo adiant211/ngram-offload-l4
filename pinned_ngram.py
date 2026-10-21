@@ -18,23 +18,28 @@ def _add(memory, key, seconds):
         memory._pin_detail[key] = memory._pin_detail.get(key, 0.0) + seconds
 
 
-def attach_cpu_inputs(model):
+def attach_cpu_inputs(model, memory=None):
     """Hand each forward's CPU ids/positions to the n-gram lookup.
 
     The handoff is consumed once per lookup. Unlike a cache keyed by CUDA
     data_ptr, it cannot return another batch's tokens after allocator reuse.
+    Under DDP, pass the DDP wrapper as the model (and the n-gram module as
+    memory): DDP copies every input tensor to the GPU before the inner
+    module's hooks run, including these CPU copies.
     """
+    memory = memory if memory is not None else model.ngram
+
     def hook(module, args):
         batch = args[0]
         if "ids_cpu" in batch:
-            module.ngram._cpu_next = (batch["ids_cpu"], batch["pos_cpu"])
+            memory._cpu_next = (batch["ids_cpu"], batch["pos_cpu"])
     return model.register_forward_pre_hook(hook)
 
 
 def _indices(memory, ids, pos):
     start = time.perf_counter()
     cached, memory._cpu_next = getattr(memory, "_cpu_next", None), None
-    if cached is None or cached[0].numel() != ids.numel():
+    if cached is None or cached[0].numel() != ids.numel() or cached[0].device.type != "cpu":
         # Correct but synchronizing: waits for queued GPU work before hashing.
         memory._cpu_input_fallbacks = getattr(memory, "_cpu_input_fallbacks", 0) + 1
         cached = ids.detach().cpu(), pos.detach().cpu()
@@ -53,7 +58,7 @@ def _indices(memory, ids, pos):
 
 
 def enable_pinned(memory, staged=False, profile=False, gpu_table=False,
-                  sparse_update="rows", update_threads=None):
+                  sparse_update="rows", update_threads=None, process_group=None):
     assert memory.table.device.type == ("cuda" if gpu_table else "cpu")
     assert sparse_update in ("rows", "blocks")
     assert not (gpu_table and sparse_update == "blocks"), "block update needs the RAM table"
@@ -67,6 +72,8 @@ def enable_pinned(memory, staged=False, profile=False, gpu_table=False,
     memory._sparse_update = sparse_update
     memory._update_threads = update_threads
     memory._update_block = 4096  # 8 MB FP32 scratch: stays cache- and malloc-friendly
+    memory._process_group = process_group
+    assert process_group is None or staged, "multi-rank n-gram sync is implemented for the staged path"
     if staged:
         # CPU inputs already exist in a real data loader; attach_cpu_inputs hands
         # them over. A CUDA round trip would wait for backward and kill overlap.
@@ -237,6 +244,10 @@ def _staged_step(memory, lr_mult=1.0):
         if slot["future"] is not None:
             slot["future"].result()
     _add(memory, "worker_final_join", time.perf_counter()-start)
+    if memory._process_group is not None:
+        start = time.perf_counter()
+        _allreduce_accumulator(memory)
+        _add(memory, "cross_rank_reduce", time.perf_counter()-start)
     threads = torch.get_num_threads()
     if memory._update_threads:
         # The GPU idles during this phase, so the whole host can work on it.
@@ -250,6 +261,39 @@ def _staged_step(memory, lr_mult=1.0):
         torch.set_num_threads(threads)
     memory._ram_profile["update"] += time.perf_counter()-begin
     return touched
+
+
+@torch.no_grad()
+def _allreduce_accumulator(memory, block=1 << 16):
+    """Average row gradients and OR touched masks across ranks, matching DDP's averaging.
+
+    Every rank then applies the identical sparse update, so the replicated tables stay
+    bit-identical without broadcasting them. NCCL needs device tensors, so the 2 GB FP32
+    accumulator is staged through the GPU in 128 MB blocks; gloo reduces host memory directly.
+    """
+    import torch.distributed as dist
+    group = memory._process_group
+    world = dist.get_world_size(group)
+    if world == 1:
+        return
+    touched = memory._host_touched.view(torch.uint8)
+    grad = memory._host_grad
+    if dist.get_backend(group) == "gloo":
+        dist.all_reduce(touched, op=dist.ReduceOp.MAX, group=group)
+        dist.all_reduce(grad, group=group)
+        grad.div_(world)
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    mask = touched.to(device)
+    dist.all_reduce(mask, op=dist.ReduceOp.MAX, group=group)
+    touched.copy_(mask)
+    staging = torch.empty(min(block, grad.shape[0]), grad.shape[1], device=device)
+    for first in range(0, grad.shape[0], block):
+        rows = grad[first:first+block]
+        part = staging[:rows.shape[0]]
+        part.copy_(rows)
+        dist.all_reduce(part, op=dist.ReduceOp.AVG, group=group)
+        rows.copy_(part)
 
 
 def _block_update(memory, lr_mult):
@@ -367,6 +411,71 @@ def check_pinned(gpu_table=False):
           gpu_table, "updates:", modes, "block table bit-identical:", len(modes) == 2, flush=True)
 
 
+def _distributed_worker(rank, world, port, mode):
+    import copy
+    import torch.distributed as dist
+    from config import NgramConfig
+    from ngram import NgramMemory
+    from ram_ngram import enable_ram_ngram
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
+    torch.set_num_threads(2)
+    torch.manual_seed(792)
+    reference = NgramMemory(NgramConfig(dim=16, total_params=65536, table_dtype="bfloat16"), 32, 1).cuda().train()
+    candidate = copy.deepcopy(reference)
+    enable_ram_ngram(candidate)
+    collect = enable_pinned(candidate, staged=True, sparse_update=mode, update_threads=2,
+                            process_group=dist.group.WORLD)
+    candidate._update_block = 1000
+    data = torch.Generator().manual_seed(5)
+    micro_per_rank = 2
+    for _ in range(2):
+        for micro in range(world*micro_per_rank):
+            ids = torch.randint(0, 60800, (193,), generator=data)
+            pos = torch.arange(193) % 37
+            upstream = torch.randn(193, reference.cfg.num_tables*reference.cfg.dim, generator=data).cuda()
+            scale = 1/(world*micro_per_rank)
+            (reference.lookup(ids.cuda(), pos.cuda())*upstream*scale).sum().backward()
+            if micro // micro_per_rank == rank:
+                candidate._cpu_next = (ids, pos)
+                # x world: the cross-rank step averages, as DDP does for dense gradients.
+                (candidate.lookup(ids.cuda(), pos.cuda())*upstream*scale*world).sum().backward()
+                collect(candidate)
+        # Every rank's reference saw all microbatches; keep its step single-process
+        # (with a process group initialized, ngram.sparse_step would all-gather rows).
+        import ngram as ngram_module
+        initialized = ngram_module.dist.is_initialized
+        ngram_module.dist.is_initialized = lambda: False
+        try:
+            touched = reference.sparse_step()
+        finally:
+            ngram_module.dist.is_initialized = initialized
+        assert candidate.sparse_step() == touched
+        torch.testing.assert_close(reference.table.cpu(), candidate.table, rtol=0.004, atol=0.0005)
+        torch.testing.assert_close(reference.row_v.cpu(), candidate.row_v, rtol=1e-4, atol=1e-6)
+    sums = torch.tensor([torch.sum(candidate.table, dtype=torch.float64),
+                         torch.sum(candidate.row_v, dtype=torch.float64)])
+    gathered = [torch.empty_like(sums) for _ in range(world)]
+    dist.all_gather(gathered, sums)
+    assert all(torch.equal(gathered[0], g) for g in gathered), gathered
+    candidate._pin_worker.shutdown()
+    dist.destroy_process_group()
+    if rank == 0:
+        print("PINNED_DISTRIBUTED_PARITY: world", world, "update:", mode,
+              "matches one process; replicas bit-identical", flush=True)
+
+
+def check_pinned_distributed(world=2, mode="blocks"):
+    """Ranks split the microbatches; the result must match one process seeing all of them."""
+    import socket
+    import torch.multiprocessing as mp
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    mp.spawn(_distributed_worker, args=(world, port, mode), nprocs=world, join=True)
+
+
 if __name__ == "__main__":
     check_pinned()
     check_pinned(gpu_table=True)
+    for mode in ("rows", "blocks"):
+        check_pinned_distributed(mode=mode)

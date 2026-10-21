@@ -81,6 +81,55 @@ fastce)  # adds the patched FLA fused cross-entropy
   run fastce-tail --compile tail --sparse-update blocks --update-threads "$(nproc)" --fast-ce
   run fastce-tail-4chunks --compile tail --sparse-update blocks --update-threads "$(nproc)" --fast-ce --loss-chunks 4
   ;;
+dion)  # Dion3 on one GPU, against AdamW with the same concat packing
+  cd /content/a100stack
+  FAST=(--compile tail --sparse-update blocks --update-threads "$(nproc)" --fast-ce --loss-chunks 4 --pack-mode concat)
+  run adamw-concat "${FAST[@]}"
+  run dion3 "${FAST[@]}" --optimizer dion3
+  ;;
+dist)  # 1 rank x accumulation 4 must match 2 gloo ranks x accumulation 2 on one GPU
+  cd /content/a100stack
+  SMALL=(--tokens 8192 --seq-len 1024 --ngram-device cpu --ram-mode staged --sparse-update blocks
+         --attn native --pack --pack-mode concat --ckpt none --fused-norms --fast-ce --loss-chunks 4
+         --compile tail --token-weighted --defer-loss-sync --data fineweb-800k-confirm.bin
+         --warmup 1 --steps 2 --optimizer dion3 --checksums --output results-dist.jsonl)
+  python -u bench100m.py "${SMALL[@]}" --grad-accum 4 > dist-world1.log 2>&1
+  torchrun --standalone --nproc_per_node 2 bench100m.py "${SMALL[@]}" --grad-accum 2 \
+    --dist-backend gloo > dist-world2.log 2>&1
+  python - <<'EOF'
+import json
+rows = [json.loads(l) for l in open("results-dist.jsonl")][-2:]
+for r in rows:
+    print("DIST", r["world_size"], json.dumps({k: r.get(k) for k in ("first_loss", "final_loss",
+          "dense_checksum", "table_checksum", "row_state_checksum", "checksum_rank_spread")}))
+a, b = rows
+rel = lambda k: abs(a[k]-b[k])/max(abs(a[k]), 1e-12)
+print("DIST_RELATIVE", json.dumps({k: rel(k) for k in ("final_loss", "dense_checksum",
+      "table_checksum", "row_state_checksum")}))
+EOF
+  ;;
+depthab)  # Depth-Attention quality A/B: same data, held-out loss, plus a second seed for noise
+  cd /content/a100stack
+  [ -f fineweb-ab-train.bin ] || python -u prepare_ab.py --train-tokens 25000000
+  AB=(--tokens 8192 --seq-len 1024 --grad-accum 8 --ngram-device cpu --ram-mode staged
+      --sparse-update blocks --update-threads "$(nproc)" --attn native --pack --pack-mode concat
+      --ckpt none --fused-norms --fast-ce --loss-chunks 4 --compile tail --token-weighted
+      --defer-loss-sync --optimizer dion3 --data fineweb-ab-train.bin --eval-data fineweb-ab-val.bin
+      --warmup 1 --steps "${AB_STEPS:-300}" --eval-exit-at 15 --output results-depthab.jsonl)
+  for arm in "base 1234 off 0" "depth 1234 softmax 0" "layerdrop 1234 off 0.2" "base-seed2 4321 off 0"; do
+    set -- $arm
+    python -u bench100m.py "${AB[@]}" --seed "$2" --depth-attn "$3" --layer-drop "$4" \
+      > "depthab-$1.log" 2>&1 || { tail -20 "depthab-$1.log"; echo "FAILED $1"; }
+    grep -h EVAL "depthab-$1.log" | sed "s/^/$1 /"
+  done
+  ;;
+layerdrop)  # throughput of the 786k recipe with constant increasing-depth layer dropout
+  cd /content/a100stack
+  FAST=(--compile tail --sparse-update blocks --update-threads "$(nproc)" --fast-ce --loss-chunks 4
+        --pack-mode concat --optimizer dion3 --layer-drop-schedule constant)
+  run ld-0.2 "${FAST[@]}" --layer-drop 0.2
+  run ld-0.4 "${FAST[@]}" --layer-drop 0.4
+  ;;
 profile)
   cd /content/a100stack
   # A later --steps overrides the one in BASE.
@@ -88,5 +137,5 @@ profile)
     --steps 1 --profile-kernels 4 --output results-iter3-profile.jsonl > iter3-profile.log 2>&1
   grep -A45 "Self CPU" iter3-profile.log | head -50; grep KERNEL_PROFILE iter3-profile.log
   ;;
-*) echo "usage: $0 setup|parity|sweep|confirm|fastce|profile [mlp|tail]"; exit 2 ;;
+*) echo "usage: $0 setup|parity|sweep|confirm|fastce|dion|dist|depthab|layerdrop|profile [mlp|tail]"; exit 2 ;;
 esac

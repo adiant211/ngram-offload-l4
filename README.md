@@ -16,6 +16,22 @@ Same model, same 786,432-token update (8 × 1,024 tokens × 96 accumulation step
 
 Loss and input gradients match the earlier implementation. The documented exceptions are the lm-head weight gradient (0.17% relative, from BF16 rounding of one GEMM operand) and one-ulp differences in sparse optimizer state. See [docs/a100stack-iteration-3-findings.md](docs/a100stack-iteration-3-findings.md).
 
+### Iteration 4: Dion3, multi-GPU, layer dropout
+
+| Same recipe, 786k-token updates | Tokens/s | GPU memory |
+|---|---:|---:|
+| AdamW | 29,180 | 6.51 / 6.92 GiB |
+| **Dion3** (`--optimizer dion3 --pack-mode concat`) | 28,826 | 6.26 / 6.57 GiB |
+| Dion3 + layer dropout, 10% mean drop rate | 30,740 | 6.26 / 6.60 GiB |
+| Dion3 + layer dropout, 20% mean drop rate | 33,409 | 6.26 / 6.61 GiB |
+| Dion3 + Depth-Attention | 28,602 | 6.28 / 6.72 GiB |
+
+- **Dion3** (microsoft/dion NorDion2) handles the 2-D matrices; AdamW inside Dion3 handles embeddings, norms and scalars.
+- **Multi-GPU:** launch with `torchrun` to get DDP, a Dion3 process group, and cross-rank reduction of the n-gram gradients.
+- **Opt-in paper techniques:** Depth-Attention (arXiv:2606.05014) and layer dropout (arXiv:2609.05275).
+
+Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-4-findings.md](docs/a100stack-iteration-4-findings.md).
+
 ## How it works
 
 - **The n-gram table lives in pinned host RAM.** Each microbatch, the CPU hashes token ids, gathers the needed rows into reusable pinned buffers and ships them to the GPU asynchronously. The row gradients come back on a separate CUDA stream and a CPU worker accumulates them while the GPU keeps computing ([pinned_ngram.py](pinned_ngram.py)).
@@ -32,13 +48,17 @@ Loss and input gradients match the earlier implementation. The documented except
 | `pinned_ngram.py` | Pinned-RAM n-gram lookup, async gradient return, CPU accumulation, sparse updates, parity check |
 | `ram_ngram.py`, `cuda_ngram_accum.py` | Simpler RAM-table and GPU-accumulator variants with parity checks |
 | `fast_flce.py` | FLA fused cross-entropy patch, with a full-size parity check |
+| `dion_optim.py` | Dion3 parameter grouping (single GPU or DDP process group) and concat-at-forward projections |
+| `depth_attention.py` | Depth-Attention value mixing across the gated-attention layers (`--depth-attn`) |
+| `layer_dropout.py` | Layer dropout with depth/time schedules and early-exit evaluation (`--layer-drop`, `--eval-exit-at`) |
+| `prepare_ab.py` | Disjoint FineWeb train/held-out fixtures for quality A/B runs |
 | `optim800k.py` | Fused-norm swap and precision experiments |
 | `prepare800k.py` | Builds the bounded, revision-pinned FineWeb fixture |
-| `iter3_colab.sh` | Colab runner: `setup`, `parity`, `sweep`, `confirm`, `fastce`, `profile` |
+| `iter3_colab.sh` | Colab runner: `setup`, `parity`, `sweep`, `confirm`, `fastce`, `dion`, `dist`, `layerdrop`, `depthab`, `profile` |
 | `run-selected-iter3.sh` | The recommended recipe |
 | `results/results-iter3.jsonl` | Raw records for all nine iteration-3 runs, with stage timings |
 | `docs/` | Findings from every iteration, oldest to newest: 100m → ram-2560 → batch-scaling → batch6 → 800k-7gb → iteration-3 |
-| `tools/` | CPU-only sparse-update microbenchmark; local compile-region trace check |
+| `tools/` | CPU-only sparse-update microbenchmark; local checks for the compile region, Dion3 wiring, Depth-Attention and layer dropout |
 
 ## Requirements
 
@@ -49,7 +69,9 @@ This repository contains the harness and optimizations only. It does **not** inc
 
 Both are supplied separately as `a100stack.zip` and `good_tokenizer.zip`.
 
-Tested environment: Google Colab, NVIDIA L4, Python 3.13, PyTorch 2.11.0+cu130 (keep Colab's build), `flash-linear-attention==0.5.2`, `fla-core==0.5.2`. `fast_flce.py` targets FLA 0.5.2's source and refuses to patch a version where its patterns are missing.
+Tested environment: Google Colab, NVIDIA L4, Python 3.13, PyTorch 2.11.0+cu130 (keep Colab's build), `flash-linear-attention==0.5.2`, `fla-core==0.5.2`. For `--optimizer dion3`, install `dion` from `git+https://github.com/microsoft/dion.git@58d38ad`. `fast_flce.py` targets FLA 0.5.2's source and refuses to patch a version where its patterns are missing.
+
+Multi-GPU: `torchrun --nproc_per_node N bench100m.py ... --ram-mode staged --pack-mode concat --optimizer dion3`. `--dist-backend gloo` lets several test ranks share one GPU. Each rank keeps its own pinned host copy of the n-gram table and accumulator, about 3 GB of host RAM per rank.
 
 ## Run
 
