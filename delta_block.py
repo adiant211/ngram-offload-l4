@@ -120,11 +120,13 @@ def install(model, num_blocks=4, variant="repo", compile_mode="default", compile
 
 
 def check(scale=4.0):
-    """Compiled port vs the eager reference on one 100m model, both variants.
+    """Compiled port vs the eager reference on one 100m model, both variants, in FP32.
 
-    Queries are scaled so routing is clearly non-uniform but not saturated (logit std ~2;
-    a saturated softmax amplifies rounding differences into large relative gradient errors).
-    The tolerance is relative to the reference's own run-to-run gradient noise."""
+    FP32 without autocast (and the per-document attention path, since varlen flash attention
+    needs BF16) makes both runs deterministic, so any real difference shows. Under BF16 the
+    DeltaNet A_log/dt_bias gradients amplify summation-order differences far beyond the
+    reference's own noise, which made a BF16 comparison inconclusive. Queries are scaled so
+    routing is clearly non-uniform but not saturated (logit std ~2)."""
     import numpy as np
     from types import SimpleNamespace
     import bench100m as bench
@@ -137,7 +139,7 @@ def check(scale=4.0):
         c.ngram.total_params = 1 << 22
         net = stack.HybridLM(c).cuda().train()
         net._loss = types.MethodType(bench.flat_fused_loss, net)
-        opts = SimpleNamespace(pack=True, pack_mode="concat", attn="native", compile="tail",
+        opts = SimpleNamespace(pack=True, pack_mode="concat", attn="loop", compile="tail",
                                compile_mode="default", ckpt="none", residual_dtype="float32",
                                fused_norms=True, loss_chunks=4)
         apply_optimizations(net, opts)
@@ -152,8 +154,7 @@ def check(scale=4.0):
 
         def run(forward):
             net.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss = forward(net, batch)
+            loss = forward(net, batch)
             loss.backward()
             net.ngram._pending.clear()
             return float(loss), {n: p.grad.detach().clone() for n, p in net.named_parameters() if p.grad is not None}
@@ -169,7 +170,7 @@ def check(scale=4.0):
             loss_rel=port[0], grad_median_rel=port[1], grad_max_rel=port[2],
             reference_noise_median=noise[1], reference_noise_max=noise[2],
             parameters=report["parameters"]), flush=True)
-        assert port[0] < 1e-3 and port[1] < max(3 * noise[1], 0.01), (variant, port, noise)
+        assert port[0] < 1e-5 and port[1] < 1e-2, (variant, port, noise)
 
 
 def reference_forward(model, batch):

@@ -11,9 +11,10 @@ MAX_RESTARTS=${MAX_RESTARTS:-20}
 # restart. Keep it next to the checkpoints so a fresh runtime can reuse it too.
 export TORCHINDUCTOR_CACHE_DIR="${CACHE_DIR:-/content/compile-cache}/inductor"
 export TRITON_CACHE_DIR="${CACHE_DIR:-/content/compile-cache}/triton"
-# 10,240 x 77 = 788,480 tokens/update keeps the device under 34 GB (measured 30.6 GiB);
-# the allocator cap turns any growth past 31 GiB into an error instead of more memory.
-ARGS=(--preset 700m --ngram-params 1200000000 --micro-tokens 10240 --grad-accum 77 --gpu-mem-cap-gib 31
+# 16,384 x 48 = 786,432 tokens/update: the A100 throughput plateau (27.5k tokens/s, 42.7 GiB on the
+# device; 20k microbatches gain nothing at 51 GiB). The allocator cap keeps growth under ~60 GB.
+# For a 34 GB ceiling use --micro-tokens 10240 --grad-accum 77 --gpu-mem-cap-gib 31 (26.4k tokens/s).
+ARGS=(--preset 700m --ngram-params 1200000000 --micro-tokens 16384 --grad-accum 48 --gpu-mem-cap-gib 52
       --steps 10000 --warmup-steps 300 --ckpt-dir "${CKPT_DIR:-ckpt700m}" --ckpt-minutes 30
       --keep 2 --resume auto --eval-every 250 --eval-exit-at 24
       --metrics metrics700m.jsonl --output results700m.jsonl "$@")

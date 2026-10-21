@@ -111,11 +111,15 @@ def plan(hw, args):
     bf16 = min(g["bf16_tflops"] for g in gpus)
     extra = DDP_EXTRA_GIB if world > 1 else 0.0
     budget = memory * args.memory_fraction
+    if args.memory_limit_gib:
+        budget = min(budget, args.memory_limit_gib)
 
     def device_gib(micro):
         return FIXED_GIB + PER_K_GIB * micro / 1024 + DEVICE_EXTRA_GIB + extra
 
-    fitting = [m for m in (8192, 10240, 12288, 16384, 20480, 24576) if device_gib(m) <= budget]
+    # A100 measurements: 16k-token microbatches reach the throughput plateau (27.5k tokens/s;
+    # 20k: 27.5k at 51 GiB), so larger microbatches would only spend memory.
+    fitting = [m for m in (8192, 10240, 12288, 16384) if device_gib(m) <= budget]
     if args.micro_tokens:
         micro = args.micro_tokens
     elif fitting:
@@ -255,6 +259,7 @@ def main():
     p.add_argument("--micro-tokens", type=int, default=0, help="override the memory-based choice")
     p.add_argument("--update-tokens", type=int, default=0, help="target tokens per update")
     p.add_argument("--memory-fraction", type=float, default=0.85, help="share of GPU memory to plan for")
+    p.add_argument("--memory-limit-gib", type=float, default=0, help="absolute per-GPU memory ceiling to plan for")
     p.add_argument("--total-tokens", type=float, default=10e9, help="schedule length in tokens")
     p.add_argument("--ngram-params", type=int, default=1_200_000_000)
     p.add_argument("--tokenizer", default=next(
