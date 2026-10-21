@@ -445,6 +445,9 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
                                        sparse_update=mode, update_threads=2)
         # Several blocks, including a partial last block, on the 4,096-row test table.
         candidates[mode]._update_block = 1000
+    # Stochastic rounding may land one BF16 ulp away from round-to-nearest on each update,
+    # which also shows in the next update's looked-up rows.
+    tol = dict(rtol=0.008, atol=0.001) if stochastic else dict(rtol=0.004, atol=0.0005)
     for step in range(2):
         for candidate in candidates.values():
             candidate._sr_step = step
@@ -458,12 +461,10 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
                 if micro != 3:  # The last microbatch exercises the synchronizing fallback.
                     candidate._cpu_next = (ids.cpu(), pos.cpu())
                 b = candidate.lookup(ids, pos)
-                torch.testing.assert_close(a, b, rtol=0.004, atol=0.0005)
+                torch.testing.assert_close(a, b, **tol)
                 (b*weight/4).sum().backward()
                 collects[mode](candidate)
         touched = reference.sparse_step()
-        # Stochastic rounding may land one BF16 ulp away from round-to-nearest on each update.
-        tol = dict(rtol=0.008, atol=0.001) if stochastic else dict(rtol=0.004, atol=0.0005)
         for candidate in candidates.values():
             assert candidate.sparse_step() == touched
             torch.testing.assert_close(reference.table.cpu(), candidate.table.cpu(), **tol)
