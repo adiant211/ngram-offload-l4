@@ -339,9 +339,9 @@ def stochastic_round_(target, value, noise):
 def _block_update(memory, lr_mult):
     """Same arithmetic as _row_update, over contiguous row blocks with a touched mask.
 
-    Most rows are touched by a 786k-token update, so gathering and scattering them
-    costs more than streaming every row once. The accumulator is cleared per block
-    while it is still in cache, which replaces a separate pass over 2 GB.
+    Blocks where most rows were touched (wide tables: 55% per 786k-token update) are streamed
+    whole; blocks with few touched rows (narrow tables: ~18%) gather, update and scatter only
+    those rows. The accumulator is cleared per block while it is still in cache.
     """
     start = time.perf_counter()
     cfg, table, touched, block = memory.cfg, memory.table, 0, memory._update_block
@@ -357,7 +357,28 @@ def _block_update(memory, lr_mult):
         mask = memory._host_touched[first:first+block]
         count = int(mask.sum())
         g = memory._host_grad[first:first+block]
-        if count:
+        if count and count < getattr(memory, "_gather_below", 0.35) * g.shape[0]:
+            # Few touched rows (narrow tables with many rows touch ~18% per update): update only
+            # those rows. Same arithmetic, in the same op order, as the dense path below.
+            touched += count
+            v = memory.row_v[first:first+block]
+            index = mask.nonzero().squeeze(1)
+            rows = g.index_select(0, index)
+            mean = rows.square().mean(1)
+            fresh = v.index_select(0, index).mul_(cfg.beta2).add_(mean, alpha=1-cfg.beta2)
+            rows.div_(fresh.sqrt().add_(cfg.eps).unsqueeze(1)).mul_(-cfg.lr*lr_mult)
+            v.index_copy_(0, index, fresh)
+            target = table[first:first+block]
+            current = target.index_select(0, index)
+            if stochastic:
+                value = current.float().add_(rows)
+                stochastic_round_(current, value, _sr_noise(memory, value.numel(), first // block))
+            else:
+                current.add_(rows.to(table.dtype))
+            target.index_copy_(0, index, current)
+            g.zero_()  # also clears any nonfinite value in masked-out entries
+            mask.zero_()
+        elif count:
             touched += count
             n = g.shape[0]
             work, low = scratch["work"][:n], scratch["low"][:n]
@@ -431,7 +452,8 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
         folded = torch.arange(60800)
         folded[1::3] -= 1  # ids 3k+1 hash as 3k; idempotent
         ngram_canon.attach(reference, folded)
-    modes = ("rows",) if gpu_table else ("rows", "blocks")
+    # "gather": the block update forced onto its gather/scatter path in every block.
+    modes = ("rows",) if gpu_table else ("rows", "blocks", "gather")
     candidates, collects = {}, {}
     for mode in modes:
         candidates[mode] = copy.deepcopy(reference)
@@ -442,9 +464,10 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
         if not gpu_table:
             enable_ram_ngram(candidates[mode])
         collects[mode] = enable_pinned(candidates[mode], staged=True, gpu_table=gpu_table,
-                                       sparse_update=mode, update_threads=2)
+                                       sparse_update="blocks" if mode == "gather" else mode, update_threads=2)
         # Several blocks, including a partial last block, on the 4,096-row test table.
         candidates[mode]._update_block = 1000
+        candidates[mode]._gather_below = 2.0 if mode == "gather" else 0.0
     # Stochastic rounding may land one BF16 ulp away from round-to-nearest on each update,
     # which also shows in the next update's looked-up rows.
     tol = dict(rtol=0.008, atol=0.001) if stochastic else dict(rtol=0.004, atol=0.0005)
@@ -471,15 +494,17 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
             torch.testing.assert_close(reference.row_v.cpu(), candidate.row_v.cpu(), rtol=1e-4, atol=1e-6)
             assert not candidate._host_touched.any() and not candidate._host_grad.any()
             assert candidate._cpu_next is None
-        if len(candidates) == 2 and not stochastic:
+        if "blocks" in candidates and not stochastic:
             # Same formula in a different layout. Vectorized and scalar tails may round
             # add_(alpha=...) differently, so row_v may move by one FP32 ulp.
-            assert torch.equal(candidates["rows"].table, candidates["blocks"].table)
-            torch.testing.assert_close(candidates["rows"].row_v, candidates["blocks"].row_v,
-                                       rtol=2.5e-7, atol=0)
+            for other in ("blocks", "gather"):
+                assert torch.equal(candidates["rows"].table, candidates[other].table), other
+                torch.testing.assert_close(candidates["rows"].row_v, candidates[other].row_v,
+                                           rtol=2.5e-7, atol=0)
     for candidate in candidates.values():
         assert candidate._cpu_input_fallbacks == 2
         candidate._pin_worker.shutdown()
+    modes = tuple(candidates)
     print("PINNED_PARITY: two updates, buffer reuse and CPU-input handoff passed; GPU table:",
           gpu_table, "updates:", modes, "canonical ids:", canon, "stochastic rounding:", stochastic,
           "block table bit-identical:", len(modes) == 2 and not stochastic, flush=True)
