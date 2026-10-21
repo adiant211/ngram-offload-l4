@@ -325,6 +325,32 @@ def start_or_stop_profile(profiler, args):
     return None
 
 
+_SYNC_SITES = {}
+
+
+def sync_debug(start):
+    """Microbatch-scoped torch.cuda sync debug mode; prints each distinct synchronizing call site."""
+    import traceback
+    import warnings
+    if start:
+        def record(message, category, filename, lineno, file=None, line=None):
+            if "synchronizing" not in str(message):
+                return
+            frames = [f"{Path(f.filename).name}:{f.lineno} {f.name}" for f in traceback.extract_stack()[:-2]
+                      if "warnings" not in f.filename][-6:]
+            key = " <- ".join(reversed(frames))
+            _SYNC_SITES[key] = _SYNC_SITES.get(key, 0) + 1
+        sync_debug.previous = warnings.showwarning
+        warnings.showwarning = record
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode(1)
+        return
+    torch.cuda.set_sync_debug_mode(0)
+    import warnings
+    warnings.showwarning = sync_debug.previous
+    print("SYNC_SITES", json.dumps(dict(sorted(_SYNC_SITES.items(), key=lambda kv: -kv[1])), indent=1), flush=True)
+
+
 # ----------------------------------------------------------------------------- main
 def parse():
     p = argparse.ArgumentParser()
@@ -384,6 +410,8 @@ def parse():
     p.add_argument("--dist-backend", choices=("nccl", "gloo"), default="nccl")
     p.add_argument("--profile-micro", type=int, default=0,
                    help="profile this many microbatches of the second update; kernel time by category")
+    p.add_argument("--sync-debug", action="store_true",
+                   help="report every CPU-GPU synchronization (with call sites) during one microbatch")
     p.add_argument("--crash-at-step", type=int, default=-1, help="test hook: hard exit during this update")
     p.add_argument("--crash-point", choices=("mid-update", "during-save"), default="mid-update")
     return p.parse_args()
@@ -607,6 +635,8 @@ def main():
         for micro in range(args.grad_accum):
             if args.profile_micro and step == start_step + 1 and micro in (1, 1 + args.profile_micro):
                 profiler = start_or_stop_profile(profiler if micro > 1 else None, args)
+            if args.sync_debug and step == start_step + 1 and micro in (1, 2):
+                sync_debug(micro == 1)
             batch, step_valid = loader.next(step, micro)
             if step == args.crash_at_step and args.crash_point == "mid-update" and micro == args.grad_accum // 2:
                 print("CRASH_TEST", json.dumps(dict(step=step, micro=micro)), flush=True)
