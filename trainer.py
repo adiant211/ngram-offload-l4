@@ -604,6 +604,11 @@ def main():
         if metrics:
             metrics.write(json.dumps(record) + "\n")
             metrics.flush()
+        if step == start_step:
+            # Compilation buffers are gone after the first update: hand that memory back
+            # and measure peaks from the steady state on.
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
         # Collective decisions, so every rank checkpoints and stops at the same update.
         flags = torch.tensor([stop["reason"] is not None,
@@ -645,7 +650,7 @@ def main():
                       mean_sparse_s=float(np.mean([r["sparse_s"] for r in timed])) if timed else None,
                       peak_alloc_gib=torch.cuda.max_memory_allocated() / 2**30,
                       peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30,
-                      peak_device_used_gib=max(r["device_used_gib"] for r in step_records),
+                      peak_device_used_gib=max(r["device_used_gib"] for r in (timed or step_records)),
                       host_peak_rss_gib=__import__("resource").getrusage(
                           __import__("resource").RUSAGE_SELF).ru_maxrss / 2**20,
                       final_loss=step_records[-1]["loss"], losses=[r["loss"] for r in step_records],
