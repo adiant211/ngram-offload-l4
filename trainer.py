@@ -358,6 +358,7 @@ def parse():
     p = argparse.ArgumentParser()
     p.add_argument("--preset", choices=("700m", "500m", "100m"), default="700m")
     p.add_argument("--ngram-params", type=int, default=1_200_000_000)
+    p.add_argument("--tokenizer", default="/content/good_tokenizer/tokenizer.json")
     p.add_argument("--data", default="fineweb-train-train.bin")
     p.add_argument("--eval-data", default="fineweb-train-val.bin")
     p.add_argument("--micro-tokens", type=int, default=16384)
@@ -374,6 +375,8 @@ def parse():
     p.add_argument("--dion-mu", type=float, default=0.95)
     p.add_argument("--dion-weight-decay", type=float, default=0.01)
     p.add_argument("--dion-triton", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--dion-replicated", action="store_true",
+                   help="multi-GPU: each rank runs the full Dion3 step (no optimizer all-gather)")
     p.add_argument("--dion-compile", action=argparse.BooleanOptionalAction, default=True,
                    help="--no-dion-compile runs dion's helpers eagerly: much faster (re)starts")
     p.add_argument("--scalar-lr", type=float, default=3e-3)
@@ -385,7 +388,13 @@ def parse():
     p.add_argument("--residual-dtype", choices=("float32", "bfloat16"), default="float32",
                    help="bfloat16 halves the saved residual-stream activations (Megatron's default)")
     p.add_argument("--fast-ce", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--update-threads", type=int, default=os.cpu_count())
+    p.add_argument("--update-threads", type=int, default=None,
+                   help="CPU threads for the table update (default: host cores / ranks on this host)")
+    p.add_argument("--ngram-sync", choices=("default", "gloo"), default="default",
+                   help="multi-GPU: gloo reduces the n-gram gradient accumulator in host memory")
+    p.add_argument("--ddp-comm-hook", choices=("none", "bf16"), default="none",
+                   help="multi-GPU: bf16 halves the dense-gradient all-reduce bytes")
+    p.add_argument("--ddp-bucket-mb", type=int, default=64)
     p.add_argument("--fla-nosync", action=argparse.BooleanOptionalAction, default=True,
                    help="remove FLA's per-microbatch CPU-GPU syncs (chunk tables, CE backward)")
     p.add_argument("--layer-drop", type=float, default=0.0)
@@ -453,7 +462,7 @@ def main():
 
     c = model_config(args.preset, args.ngram_params)
     from tokenizers import Tokenizer
-    tok = Tokenizer.from_file("/content/good_tokenizer/tokenizer.json")
+    tok = Tokenizer.from_file(args.tokenizer)
     assert max(tok.get_vocab().values()) + 1 == c.vocab_size
     eos = tok.token_to_id("<eos>")
 
@@ -471,6 +480,13 @@ def main():
         fast_flce.install()
         model.register_forward_pre_hook(lambda module, inputs: fast_flce.set_next_total(inputs[0]["valid_tokens"]))
     group = dist.group.WORLD if distributed else None
+    if distributed and args.ngram_sync == "gloo":
+        # Reduce the host-resident n-gram accumulator in host memory: the NCCL path stages
+        # the 4.8 GB FP32 accumulator through the GPUs, crossing PCIe twice per update.
+        group = dist.new_group(backend="gloo")
+    if args.update_threads is None:
+        # Ranks on one host share its cores for the end-of-update table step.
+        args.update_threads = max(1, os.cpu_count() // int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
     from ram_ngram import enable_ram_ngram
     from pinned_ngram import attach_cpu_inputs, enable_pinned
     enable_ram_ngram(model.ngram)
@@ -536,14 +552,23 @@ def main():
         from torch.nn.parallel import DistributedDataParallel as DDP
         DDP._set_params_and_buffers_to_ignore_for_model(model, list(NGRAM_KEYS))
         train_model = DDP(model, device_ids=[torch.cuda.current_device()], broadcast_buffers=False,
-                          gradient_as_bucket_view=True, bucket_cap_mb=64)
+                          gradient_as_bucket_view=True, bucket_cap_mb=args.ddp_bucket_mb)
+        if args.ddp_comm_hook == "bf16":
+            # Halves the bytes of the per-update gradient all-reduce (slow PCIe, no NVLink).
+            from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+            train_model.register_comm_hook(None, default_hooks.bf16_compress_hook)
         attach_cpu_inputs(train_model, model.ngram)
     if args.optimizer == "dion3":
         from dion_optim import build_dion3, eager_dion
         if not args.dion_compile:
             log("DION_EAGER", json.dumps(dict(unwrapped=eager_dion())))
-        optimizer, groups = build_dion3(model, args, train_model.process_group if distributed else None)
-        log("OPTIMIZER", json.dumps(dict(name="dion3", world=world, **groups)))
+        # Replicated: every rank runs the whole Dion3 step on its (identical, all-reduced)
+        # gradients; no optimizer communication. Sharded: ranks split the orthogonalization
+        # and all-gather ~1.3 GB of updated matrices per step, which costs more than it saves
+        # on a slow host link.
+        shard = distributed and not args.dion_replicated
+        optimizer, groups = build_dion3(model, args, train_model.process_group if shard else None)
+        log("OPTIMIZER", json.dumps(dict(name="dion3", world=world, sharded=shard, **groups)))
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.adamw_lr, betas=(0.9, 0.95),
                                       weight_decay=0.01, fused=True)
@@ -738,6 +763,18 @@ def main():
         evaluation = evaluate()
     elif step_records:
         evaluation = {k: v for k, v in step_records[-1].items() if k.startswith("eval_")}
+    replicas = None
+    if distributed:
+        # Every rank applies identical updates, so dense weights, table and row state must agree.
+        with torch.no_grad():
+            sums = torch.tensor([sum(float(p.detach().double().sum()) for p in model.parameters()),
+                                 checksum(model.ngram.table), checksum(model.ngram.row_v)],
+                                dtype=torch.float64, device="cuda")
+        high, low = sums.clone(), sums.clone()
+        dist.all_reduce(high, op=dist.ReduceOp.MAX)
+        dist.all_reduce(low, op=dist.ReduceOp.MIN)
+        replicas = dict(zip(("dense", "table", "row_state"), (high - low).tolist()))
+        log("REPLICA_SPREAD", json.dumps(replicas))
     if rank == 0 and step_records:
         result = dict(run=args.run_name, preset=args.preset, **report, world_size=world,
                       gpu=torch.cuda.get_device_name(0), torch=torch.__version__,
@@ -759,6 +796,7 @@ def main():
                       final_loss=step_records[-1]["loss"], losses=[r["loss"] for r in step_records],
                       cpu_input_fallbacks=model.ngram._cpu_input_fallbacks,
                       fla_nosync=dict(__import__("fla_nosync").stats) if args.fla_nosync else None,
+                      replica_spread=replicas,
                       dynamo_unique_graphs=__import__("torch._dynamo.utils").
                       _dynamo.utils.counters["stats"]["unique_graphs"],
                       args=vars(args))

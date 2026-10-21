@@ -32,8 +32,9 @@ def main():
     parser.add_argument("--val-tokens", type=int, default=2_097_153)
     parser.add_argument("--prefix", default="fineweb-train")
     parser.add_argument("--batch-docs", type=int, default=2048)
+    parser.add_argument("--tokenizer", default="/content/good_tokenizer/tokenizer.json")
     args = parser.parse_args()
-    tokenizer_path = Path("/content/good_tokenizer/tokenizer.json")
+    tokenizer_path = Path(args.tokenizer)
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     eos = tokenizer.token_to_id("<eos>")
     revision = "9bb295ddab0e05d785b879661af7260fed5140fc"
