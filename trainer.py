@@ -268,6 +268,63 @@ def discard_sparse(memory):
     memory._host_touched.zero_()
 
 
+def kernel_category(name):
+    n = name.lower()
+    if "memcpy" in n or "memset" in n:
+        return "copies/memset"
+    if any(k in n for k in ("gemm", "cutlass", "xmma", "sm80_", "ampere_", "cublas", "s16816", "splitk")):
+        return "GEMM (cuBLAS/CUTLASS)"
+    if "flash" in n or "fmha" in n:
+        return "softmax attention (varlen flash)"
+    if n.startswith("triton_"):
+        return "Inductor fused regions (compiled tails)"
+    if any(k in n for k in ("chunk", "delta", "recurrent", "conv", "l2norm", "solve_tril", "wy_", "kkt",
+                            "cumsum", "local_cumsum", "fused_gate", "gate")):
+        return "FLA DeltaNet path (conv, chunked delta rule, gates)"
+    if any(k in n for k in ("cross_entropy", "logsumexp", "ce_", "softmax", "flce", "linear_cross")):
+        return "fused cross-entropy"
+    if any(k in n for k in ("norm", "rms", "layer_norm")):
+        return "norms (FLA fused)"
+    if any(k in n for k in ("index", "embedding", "scatter", "gather")):
+        return "index/embedding/gather"
+    return "other ATen elementwise/reductions"
+
+
+def start_or_stop_profile(profiler, args):
+    """Second update: profile microbatches (start at micro 1, stop after --profile-micro)."""
+    from torch.profiler import ProfilerActivity, profile
+    from torch.autograd import DeviceType
+    torch.cuda.synchronize()
+    if profiler is None:
+        # Device activity only: CPU-side tracing would itself slow the host and open GPU gaps.
+        profiler = profile(activities=[ProfilerActivity.CUDA])
+        profiler.__enter__()
+        profiler._wall = time.perf_counter()
+        return profiler
+    torch.cuda.synchronize()
+    wall = time.perf_counter() - profiler._wall
+    profiler.__exit__(None, None, None)
+    events = [e for e in profiler.key_averages() if e.device_type == DeviceType.CUDA]
+    total = sum(e.self_device_time_total for e in events) / 1e6
+    categories = {}
+    for e in events:
+        key = kernel_category(e.key)
+        categories[key] = categories.get(key, 0.0) + e.self_device_time_total / 1e6
+    top = sorted(events, key=lambda e: -e.self_device_time_total)[:40]
+    lines = [f"{e.self_device_time_total/1e6/args.profile_micro*1000:9.2f} ms/micro {e.count//args.profile_micro:5d}x  "
+             f"{kernel_category(e.key)[:22]:22s}  {e.key[:110]}" for e in top]
+    Path(args.output).with_suffix(".kernels.txt").write_text("\n".join(lines) + "\n")
+    print("KERNELS_TOP\n" + "\n".join(lines), flush=True)
+    print("KERNEL_PROFILE", json.dumps(dict(
+        microbatches=args.profile_micro, wall_ms_per_micro=wall / args.profile_micro * 1000,
+        kernel_ms_per_micro=total / args.profile_micro * 1000, gpu_busy_fraction=total / wall,
+        categories_ms_per_micro={k: round(v / args.profile_micro * 1000, 2)
+                                 for k, v in sorted(categories.items(), key=lambda kv: -kv[1])},
+        categories_share={k: round(v / total, 4) for k, v in sorted(categories.items(), key=lambda kv: -kv[1])})),
+        flush=True)
+    return None
+
+
 # ----------------------------------------------------------------------------- main
 def parse():
     p = argparse.ArgumentParser()
@@ -325,6 +382,8 @@ def parse():
                    help="hard cap on this process's CUDA allocations (allocator fraction)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--dist-backend", choices=("nccl", "gloo"), default="nccl")
+    p.add_argument("--profile-micro", type=int, default=0,
+                   help="profile this many microbatches of the second update; kernel time by category")
     p.add_argument("--crash-at-step", type=int, default=-1, help="test hook: hard exit during this update")
     p.add_argument("--crash-point", choices=("mid-update", "during-save"), default="mid-update")
     return p.parse_args()
@@ -535,7 +594,7 @@ def main():
     log("CONFIG", json.dumps(dict(start_step=start_step, last_step=last_step, world=world,
                                   update_tokens=args.micro_tokens * args.grad_accum * world,
                                   data_blocks=windows.blocks, eval_microbatches=len(eval_batches))))
-    timed, step_records = [], []
+    timed, step_records, profiler = [], [], None
     last_ckpt_time, consecutive_skips, evaluation = time.time(), 0, {}
     peak_tflops = args.peak_tflops * 1e12
     for step in range(start_step, last_step):
@@ -546,6 +605,8 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         values, flops, update_tokens = [], 0.0, 0
         for micro in range(args.grad_accum):
+            if args.profile_micro and step == start_step + 1 and micro in (1, 1 + args.profile_micro):
+                profiler = start_or_stop_profile(profiler if micro > 1 else None, args)
             batch, step_valid = loader.next(step, micro)
             if step == args.crash_at_step and args.crash_point == "mid-update" and micro == args.grad_accum // 2:
                 print("CRASH_TEST", json.dumps(dict(step=step, micro=micro)), flush=True)
