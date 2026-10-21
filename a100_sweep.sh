@@ -27,6 +27,8 @@ run_arm() {
     m24k-ce2)    arm m24k-ce2 --micro-tokens 24576 --grad-accum 32 --loss-chunks 2 ;;
     m8k)         arm m8k --micro-tokens 8192 --grad-accum 96 ;;
     m12k)        arm m12k --micro-tokens 12288 --grad-accum 64 ;;
+    m12k-bf16)   arm m12k-bf16 --micro-tokens 12288 --grad-accum 64 --residual-dtype bfloat16 ;;
+    m16k-bf16)   arm m16k-bf16 --micro-tokens 16384 --grad-accum 48 --residual-dtype bfloat16 ;;
     m12k-ce8)    arm m12k-ce8 --micro-tokens 12288 --grad-accum 64 --loss-chunks 8 ;;
     m8k-ld02)    arm m8k-ld02 --micro-tokens 8192 --grad-accum 96 --layer-drop 0.2 --layer-drop-schedule constant ;;
     m12k-ld02)   arm m12k-ld02 --micro-tokens 12288 --grad-accum 64 --layer-drop 0.2 --layer-drop-schedule constant ;;

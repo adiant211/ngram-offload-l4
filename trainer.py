@@ -297,6 +297,8 @@ def parse():
     p.add_argument("--compile", choices=("none", "mlp", "tail"), default="tail")
     p.add_argument("--compile-mode", default="default")
     p.add_argument("--loss-chunks", type=int, default=4)
+    p.add_argument("--residual-dtype", choices=("float32", "bfloat16"), default="float32",
+                   help="bfloat16 halves the saved residual-stream activations (Megatron's default)")
     p.add_argument("--fast-ce", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--update-threads", type=int, default=os.cpu_count())
     p.add_argument("--layer-drop", type=float, default=0.0)
@@ -387,7 +389,7 @@ def main():
     report = model.param_report()
     log("MODEL", json.dumps(dict(preset=args.preset, **report, rows_per_table=c.ngram.rows_per_table)))
     opts = SimpleNamespace(pack=True, pack_mode="concat", attn="native", compile=args.compile,
-                           compile_mode=args.compile_mode, ckpt="none", residual_dtype="float32",
+                           compile_mode=args.compile_mode, ckpt="none", residual_dtype=args.residual_dtype,
                            fused_norms=True, loss_chunks=args.loss_chunks)
     from optim800k import apply_optimizations
     apply_optimizations(model, opts)
