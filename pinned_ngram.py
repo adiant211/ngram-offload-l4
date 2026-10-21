@@ -178,11 +178,15 @@ def _staged_lookup(memory, ids, pos):
         slot["rows"] = torch.empty(shape, dtype=memory.table.dtype, pin_memory=True)
         slot["grad"] = torch.empty(shape, dtype=torch.float32, pin_memory=True)
         slot["indices"] = torch.empty_like(idx, pin_memory=True)
+        slot["valid"] = torch.empty_like(valid, pin_memory=True)
     start = time.perf_counter()
     if memory.table.device.type == "cpu":
         torch.index_select(memory.table, 0, idx.reshape(-1), out=slot["rows"])
     else:
         slot["indices"].copy_(idx)
+    # A pageable host-to-device copy waits for all queued GPU work before it starts,
+    # which would drain the GPU queue once per microbatch; the mask goes through pinned memory.
+    slot["valid"].copy_(valid)
     _add(memory, "cpu_gather", time.perf_counter()-start)
     a, z = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     a.record()
@@ -190,13 +194,14 @@ def _staged_lookup(memory, ids, pos):
         rows = slot["rows"].to(ids.device, non_blocking=True)
     else:
         rows = F.embedding(slot["indices"].to(ids.device, non_blocking=True), memory.table)
+    valid_device = slot["valid"].to(ids.device, non_blocking=True)
     z.record()
     slot["h2d_done"] = z
     emb = rows.view(*idx.shape, memory.cfg.dim).float()
     if memory.training and torch.is_grad_enabled():
         emb.requires_grad_(True)
         memory._ram_pending.append((idx.reshape(-1), valid.reshape(-1), emb, slot, a, z))
-    result = (emb*valid.to(ids.device, non_blocking=True).unsqueeze(-1)).flatten(1)
+    result = (emb*valid_device.unsqueeze(-1)).flatten(1)
     memory._ram_profile["lookup"] += time.perf_counter()-begin
     return result
 
