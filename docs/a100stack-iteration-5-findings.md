@@ -210,7 +210,78 @@ Remaining slow-link costs, in order of size:
   microbatch's rows while the current one computes would hide them; this is exact, since the table only
   changes between updates.
 
-## 6. Limits and next steps
+## 6. Single GPU, ~60 GB ceiling
+
+Same configuration, ~786k-token updates, FLA sync removal on, measured back to back:
+
+| Microbatch × accumulation | Tokens/s | vs 10k | Allocated peak | Device |
+|---|---:|---:|---:|---:|
+| 10,240 × 77 | 26,379 | — | 29.8 GiB | 30.6 GiB |
+| **16,384 × 48** | **27,504** | **+4.3%** | 41.1 GiB | **42.7 GiB** |
+| 20,480 × 38 | 27,502 | +4.3% | 49.6 GiB | 51.2 GiB |
+| 24,576 × 32 | 28,145 | +6.7% | 57.2 GiB | 58.1 GiB |
+| 16,384 × 48 + layer dropout p_max 0.2 (constant, 9.7% of blocks skipped) | 29,858 | +13.2% | 41.1 GiB | 42.1 GiB |
+
+- **Default: 16k microbatches.** Throughput reaches its plateau there. 20k gains nothing for 8.5 GiB more; 24k gains 2.3% for 15 GiB more and sits ~2 GiB under a 60 GiB ceiling, with ~1 GiB of extra non-allocator memory after a cold compile.
+- `train700m.sh` now uses 16,384 × 48 with a 52 GiB allocator cap. `run.py` plans up to 16k and takes `--memory-limit-gib`.
+- With the FLA syncs gone, larger microbatches help less than before the fix: 16k vs 10k is +4.3% now.
+- The remaining real lever is layer dropout: +8.6% at the same memory. It changes training, so it stays opt-in. With the paper's decreasing schedule the run-average gain is about half of that.
+
+## 7. Delta Block attention residuals (`--delta-block`)
+
+Ported from Luo, Cai, Hu, "Delta Attention Residuals" (github.com/wdlctc/delta-attention-residuals-code,
+mode `delta_block`; reported −0.5 to −1.6 perplexity from 220M to 1B parameters).
+
+**What it does:**
+- Each sublayer reads x + Σᵢ softmaxᵢ(q · RMSNorm_w(sᵢ)) sᵢ over at most 4 sources: the embedding, plus a source closed at the start of each 8-layer block.
+- The residual stream itself is unchanged.
+- Each sublayer has its own q and w: 4·d parameters per layer, 161,280 in total.
+
+**Complexity of the published core:** about 115 lines. It is a mixing function and kernel, one branch in the
+decoder layer, a source list in the model loop, and two config fields. No new matmuls.
+
+**Published sources versus the description:** the published code closes sources as
+`s_k = x_k − s_{k−1}`, so beyond the second block they are alternating sums
+(s₂ = Δ₂ + x₀, s₃ = Δ₃ + Δ₁), not pure block deltas. `--delta-variant repo` (default)
+reproduces the code that produced the published numbers; `--delta-variant paper` uses true deltas.
+
+**Port (`delta_block.py`):**
+- The mixing is fused into the compiled regions: mix + norm1 before the mixer; residual add + mix + norm2 + MLP + residual add for the MLP.
+- No stacked [N, T, D] copies are built.
+- Routing logits are computed in FP32.
+- Layer-dropout plans and early-exit evaluation work.
+
+**Equivalence check:** in FP32 against an eager reference of the published code, the losses agree to
+4e-7 and gradients to a median 0.17%, against a reference noise of 0. Under BF16, a comparison is
+inconclusive: the DeltaNet `A_log`/`dt_bias` gradients amplify summation-order differences far
+beyond the reference's own 0.6% run-to-run noise.
+
+**Overhead in this stack is not low.** At 10,240 × 77:
+
+| | Base | With Delta Block |
+|---|---:|---:|
+| Throughput | 26,379 tokens/s | 22,637 tokens/s (**−14.2%**) |
+| Memory (allocated / device) | 29.8 / 30.6 GiB | 29.9 / 30.8 GiB |
+
+The kernel profile adds 58 ms per 10k-token microbatch (368 → 426 ms):
+- **+49 ms** in the compiled regions (the mixing and its backward over FP32 sources);
+- **+16 ms** of gradient-accumulation adds, because each source feeds up to 63 sublayers;
+- **−6 ms** from norm1 moving into the compiled region.
+
+The unavoidable extra memory traffic is about 13 ms (~3.5%), so a hand-written implementation could get
+closer to that bound. Two ways in:
+- Compute every sublayer's routing logits with one GEMM per source when the source is created; the
+  queries are parameters, so they are known up front.
+- Write a custom autograd function that accumulates source gradients once per block.
+
+The width (1,280) is small relative to the [T, d] streams the mixing reads, which is why the overhead
+is larger here than in the paper's setting.
+
+**Recommendation:** keep it opt-in. A 14% throughput cost against a reported 1.7–2.6% perplexity gain
+(533M–1B) is not a clear win without a quality A/B on this model. Reducing the overhead first is the
+better order.
+
+## 8. Limits and next steps
 
 - Checkpoints in `/content` survive process crashes, not the loss of the Colab runtime. For
   that, mount Google Drive (or other storage) and pass `CKPT_DIR` and `CACHE_DIR` there.

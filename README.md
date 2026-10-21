@@ -39,9 +39,12 @@ Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-
 
 | Microbatch × accumulation | Tokens/s | MFU | GPU memory (`nvidia-smi`) |
 |---|---:|---:|---:|
-| 16,384 × 48 (before the FLA sync removal) | 27,276 | 38.6% | 42.1 GiB |
-| **10,240 × 77 (default, < 34 GB)** | **26,456** | 37.4% | **30.7 GiB** |
-| 8,192 × 96 (before the FLA sync removal) | 22,875 | 32.4% | 26.5 GiB |
+| 10,240 × 77 (34 GB ceiling) | 26,379 | 37.3% | 30.6 GiB |
+| **16,384 × 48 (default, ~60 GB ceiling)** | **27,504** | 38.9% | **42.7 GiB** |
+| 20,480 × 38 | 27,502 | 38.9% | 51.2 GiB |
+| 24,576 × 32 | 28,145 | 39.8% | 58.1 GiB |
+| 16,384 × 48 + layer dropout (p_max 0.2) | 29,858 | — | 42.1 GiB |
+| 10,240 × 77 + Delta Block (opt-in) | 22,637 | — | 30.8 GiB |
 
 - `trainer.py` is a recoverable training loop:
   - deterministic resumable data and a WSD schedule;
@@ -51,7 +54,7 @@ Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-
 - `train700m.sh` restarts it from the newest complete checkpoint after a crash.
 - `recovery_test.sh` kills runs mid-update and mid-checkpoint and checks the resumed runs.
 
-Layer dropout (p_max 0.2) adds about 10% on top. A supervised run was killed with `kill -9` and resumed from its checkpoint automatically, with matching losses. See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings.md).
+Throughput plateaus at 16k-token microbatches; 24k buys 2.3% for 15 GiB more. Layer dropout (p_max 0.2) adds 8.6%. Delta Block attention residuals (`--delta-block`, ported from Luo, Cai and Hu's published code) are available but cost 14% throughput in this stack. A supervised run was killed with `kill -9` and resumed from its checkpoint automatically, with matching losses. See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings.md).
 
 ## How it works
 
@@ -78,6 +81,7 @@ Layer dropout (p_max 0.2) adds about 10% on top. A supervised run was killed wit
 | `train700m.sh` | Supervised 700M + 1.2B run under 34 GB GPU memory; restarts from the last checkpoint |
 | `recovery_test.sh` | Crash/resume/SIGTERM test at full model size |
 | `a100_sweep.sh` | A100 microbatch/memory/layer-dropout throughput sweep |
+| `delta_block.py` | Delta Block attention residuals (opt-in `--delta-block`), fused into the compiled regions, with an FP32 equivalence check against the published code |
 | `fla_nosync.py` | Removes FLA 0.5.2's per-microbatch CPU-GPU syncs (chunk tables, CE backward), with a parity check |
 | `prepare_fineweb.py` | Batched FineWeb tokenization into disjoint train/held-out files (300M tokens in ~5 min) |
 | `optim800k.py` | Fused-norm swap and precision experiments |
