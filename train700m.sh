@@ -7,6 +7,10 @@
 set -uo pipefail
 cd /content/a100stack
 MAX_RESTARTS=${MAX_RESTARTS:-20}
+# Compiled kernels: a warm cache turns a ~12-minute first update into ~1 minute after a
+# restart. Keep it next to the checkpoints so a fresh runtime can reuse it too.
+export TORCHINDUCTOR_CACHE_DIR="${CACHE_DIR:-/content/compile-cache}/inductor"
+export TRITON_CACHE_DIR="${CACHE_DIR:-/content/compile-cache}/triton"
 ARGS=(--preset 700m --ngram-params 1200000000 --micro-tokens 16384 --grad-accum 32
       --steps 10000 --warmup-steps 300 --ckpt-dir "${CKPT_DIR:-ckpt700m}" --ckpt-minutes 30
       --keep 2 --resume auto --eval-every 250 --eval-exit-at 24

@@ -284,6 +284,8 @@ def parse():
     p.add_argument("--dion-mu", type=float, default=0.95)
     p.add_argument("--dion-weight-decay", type=float, default=0.01)
     p.add_argument("--dion-triton", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--dion-compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="--no-dion-compile runs dion's helpers eagerly: much faster (re)starts")
     p.add_argument("--scalar-lr", type=float, default=3e-3)
     p.add_argument("--adamw-lr", type=float, default=3e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -426,7 +428,9 @@ def main():
                           gradient_as_bucket_view=True, bucket_cap_mb=64)
         attach_cpu_inputs(train_model, model.ngram)
     if args.optimizer == "dion3":
-        from dion_optim import build_dion3
+        from dion_optim import build_dion3, eager_dion
+        if not args.dion_compile:
+            log("DION_EAGER", json.dumps(dict(unwrapped=eager_dion())))
         optimizer, groups = build_dion3(model, args, train_model.process_group if distributed else None)
         log("OPTIMIZER", json.dumps(dict(name="dion3", world=world, **groups)))
     else:

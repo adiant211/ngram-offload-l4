@@ -53,6 +53,26 @@ def split_params(model):
     return matrix, embed, head, other
 
 
+def eager_dion():
+    """Replace dion's torch.compile-wrapped helpers with the original functions.
+
+    The compiled helpers are traced again for every megabatch shape in a fresh process,
+    which costs minutes per (re)start of a large model. Returns how many were unwrapped.
+    """
+    import sys
+    import dion  # noqa: F401  (loads the submodules)
+    count = 0
+    for name, module in list(sys.modules.items()):
+        if not (name == "dion" or name.startswith("dion.")) or module is None:
+            continue
+        for attribute, value in list(vars(module).items()):
+            original = getattr(value, "_torchdynamo_orig_callable", None)
+            if callable(value) and original is not None:
+                setattr(module, attribute, original)
+                count += 1
+    return count
+
+
 def build_dion3(model, args, process_group=None):
     from dion import Dion3
     matrix, embed, head, other = split_params(model)
