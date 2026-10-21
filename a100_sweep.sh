@@ -24,6 +24,7 @@ run_arm() {
   case "$1" in
     m16k)        arm m16k --micro-tokens 16384 --grad-accum 48 ;;
     m24k)        arm m24k --micro-tokens 24576 --grad-accum 32 ;;
+    m20k)        arm m20k --micro-tokens 20480 --grad-accum 38 ;;
     m24k-ce2)    arm m24k-ce2 --micro-tokens 24576 --grad-accum 32 --loss-chunks 2 ;;
     m8k)         arm m8k --micro-tokens 8192 --grad-accum 96 ;;
     m12k)        arm m12k --micro-tokens 12288 --grad-accum 64 ;;
