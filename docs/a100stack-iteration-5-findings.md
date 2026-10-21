@@ -163,7 +163,54 @@ The loss barely moves because the schedule warms up over 300 updates (236M token
 stopped at 18% of peak learning rate. This run demonstrates the mechanics, not convergence. Rerunning
 `bash train700m.sh` continues from update 54.
 
-## 5. Limits and next steps
+## 5. Two CMP 170HX: `run.py`
+
+The CMP 170HX is a GA100 with 70 SMs (A100: 108) and ~1.5 TB/s HBM2e. Its host link is
+PCIe **Gen1 x4**, about 0.8 GB/s, with no NVLink. Stock cards have 8 GB; this plan assumes
+64 GB cards. On such a link the multi-GPU path from iteration 4 would spend most of its time
+moving bytes, so `run.py` measures the hardware and picks slow-link options:
+
+| Traffic per ~1M-token update | Iteration-4 path | Slow-link path (`run.py`) |
+|---|---|---|
+| Dense gradient all-reduce | 2.9 GB FP32 over PCIe | `--ddp-comm-hook bf16`: 1.4 GB |
+| N-gram gradient accumulator (4.8 GB FP32) | staged through the GPUs, crossing PCIe twice | `--ngram-sync gloo`: reduced in host memory, never crosses PCIe |
+| Dion3 | ranks split the orthogonalization, then all-gather ~1.3 GB | `--dion-replicated`: every rank runs the whole 0.2 s step; no optimizer traffic |
+| Replica consistency | exact (all-gathered) | rank 0 broadcasts weights + optimizer state every `--resync-every 50` updates (~0.1 s per update amortized) |
+| CPU threads | all cores per rank | cores split across ranks |
+
+`run.py` also:
+
+- **probes the hardware** in a child process (memory, SMs, pinned H2D/D2H bandwidth, BF16 and FP32 GEMM
+  rates, peer access, host RAM and cores);
+- **chooses the microbatch** from the measured A100 memory model (≤ 85% of GPU memory) and **sizes the
+  updates** at ~1M tokens to amortize the per-update communication;
+- **patches `model.py`** and launches `torchrun` under a supervisor that resumes from the newest
+  checkpoint after a crash; Ctrl-C/SIGTERM stops the run with a checkpoint.
+
+Verified on the Colab A100 with two gloo ranks sharing the GPU (100m preset):
+
+- per-rank checkpoint files, resume of both ranks with checksums verified;
+- table and row state bit-identical across ranks;
+- dense weights drift by rounding without a resync (spread 6.7e-7 after 3 updates) and are
+  identical with one: spread 0.0 / 0.0 / 0.0 with `--resync-every 1`.
+
+Plan for 2 × 64 GB, at 0.8 GB/s:
+
+- 20,480 × 26 per rank (1,064,960 tokens per update), ~51 GiB per GPU.
+- Estimated ~26k tokens/s for the pair, about one A100-80GB. Per update:
+  31.4 s forward/backward, 2.7 s n-gram row copies, 1.8 s gradient all-reduce, 1.6 s n-gram
+  reduction, 2.8 s table updates.
+- These are estimates scaled from the A100 measurements, not measurements on a 170HX.
+
+Remaining slow-link costs, in order of size:
+
+- **Table update (2.8 s):** both ranks stream their own replicated table on shared cores. A single
+  shared-memory table with per-rank halves would halve it and remove the 1.6 s n-gram reduction.
+- **N-gram row copies (2.7 s):** they run in the compute stream before each forward. Copying the next
+  microbatch's rows while the current one computes would hide them; this is exact, since the table only
+  changes between updates.
+
+## 6. Limits and next steps
 
 - Checkpoints in `/content` survive process crashes, not the loss of the Colab runtime. For
   that, mount Google Drive (or other storage) and pass `CKPT_DIR` and `CACHE_DIR` there.

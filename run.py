@@ -147,6 +147,8 @@ def plan(hw, args):
         # every rank streams the whole table; ranks share the host's memory bandwidth.
         table_update=1.4 * world,
         dion3=0.16 * A100_BF16_TFLOPS / bf16,
+        # replicated Dion3: rank 0 broadcasts FP32 weights + momentum (~5.4 GB) every 50 updates.
+        replica_resync=5.4e9 / (pcie * 1e9) / 50 if world > 1 and slow_pcie else 0.0,
     )
     total_s = sum(budget_s.values())
     estimate = dict(seconds_per_update={k: round(v, 1) for k, v in budget_s.items()},

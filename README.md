@@ -73,6 +73,7 @@ Layer dropout (p_max 0.2) adds about 10% on top. A supervised run was killed wit
 | `depth_attention.py` | Depth-Attention value mixing across the gated-attention layers (`--depth-attn`) |
 | `layer_dropout.py` | Layer dropout with depth/time schedules and early-exit evaluation (`--layer-drop`, `--eval-exit-at`) |
 | `prepare_ab.py` | Disjoint FineWeb train/held-out fixtures for quality A/B runs |
+| `run.py` | Hardware-probed launcher (tuned for 2x CMP 170HX: slow PCIe, no NVLink); supervised torchrun with auto-resume |
 | `trainer.py` | Recoverable training loop (700m/500m/100m presets): streaming data, WSD schedule, atomic checkpoints, resume, signals |
 | `train700m.sh` | Supervised 700M + 1.2B run under 34 GB GPU memory; restarts from the last checkpoint |
 | `recovery_test.sh` | Crash/resume/SIGTERM test at full model size |
@@ -117,6 +118,13 @@ For the 700M + 1.2B training run on an A100 (after `setup` and `pip install "git
 cd /content/a100stack && python -u prepare_fineweb.py --train-tokens 300000000
 bash train700m.sh                      # resumes automatically; pkill -TERM -f trainer.py stops cleanly
 CKPT_DIR=/content/drive/MyDrive/ckpt700m CACHE_DIR=/content/drive/MyDrive/cache700m bash train700m.sh  # survives runtime loss
+```
+
+On your own multi-GPU host (e.g. 2x CMP 170HX), from the a100stack source directory with this repository's files:
+
+```bash
+python run.py --probe-only   # measure the GPUs and the host link, print the plan and a time estimate
+python run.py                # supervised torchrun run with the chosen settings; resumes after a crash
 ```
 
 Each benchmark run prints a `RESULT` JSON line and appends it to `results-iter3.jsonl`, with throughput, memory peaks, stage timings and correctness flags. Add `--profile-kernels 4` for a post-timing CUDA kernel table.
