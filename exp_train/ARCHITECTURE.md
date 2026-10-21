@@ -11,8 +11,8 @@
 | MLP | SwiGLU, 3,200 |
 | Residuals | pre-norm (RMSNorm), gated residual adds (x + 2·sigmoid(a)·f(x)) |
 | Vocabulary | 60,800, embedding tied to the output head |
-| Dense parameters | 715,990,240 |
-| N-gram memory | 1,199,998,976 BF16 parameters in pinned CPU RAM: bigram + trigram, 2 hash functions each = 4 tables × 585,937 rows × 512. The lookup is added before block 2 through a 2,048→1,280 projection with a context gate |
+| Dense parameters | 714,026,720 (with the default n-gram shape) |
+| N-gram memory | 600,000,000 BF16 parameters in pinned CPU RAM: bigram + trigram, 4 hash functions each = 8 tables × 2,343,750 rows × 32. Token ids are normalized before hashing (60,800 → 45,455 classes). One lookup per microbatch is added at two points, before block 2 and before block 16, each through its own 256→1,280 projection and context gate |
 
 The source is a100stack (`code/model.py`, `config.py`, `ngram.py`). The `700m` preset is its `500m` preset
 (32 × 1,024) widened to 1,280. `code/model.py` has two small fixes applied (a flat input to the fused
@@ -24,7 +24,11 @@ Defaults in **bold** are on. Everything else is opt-in.
 
 **1. Model definition**
 - Architecture, weights and parameter names unchanged, so checkpoints stay compatible.
-- Opt-in: layer dropout, Depth-Attention, Delta Block, other shapes via `[model.shape]`.
+- **On by default:**
+  - **Delta Block** attention residuals: sublayer inputs mix block-level depth sources.
+  - **Layer dropout:** deepest block 0.25 → 0.05 by the start of the LR decay, rising with depth.
+- **N-gram memory reshaped:** 600M as 8 × 2.34M × 32; normalized-token hashing; second injection point.
+- Opt-in: Depth-Attention, other shapes via `[model.shape]`.
 
 **2. Execution (same math, faster)**
 - **Projections:** q/k/v/gate and gate/up each run as one GEMM; parameters stay separate.
@@ -42,8 +46,11 @@ Defaults in **bold** are on. Everything else is opt-in.
 **3. N-gram memory in CPU RAM**
 - Token ids are hashed on the CPU, rows gathered into pinned buffers and copied to the GPU asynchronously.
 - Row gradients return on a side stream and are accumulated in an FP32 host buffer by a worker thread.
-- Once per update, a sparse row-RMSprop step streams the table in 4,096-row blocks over all CPU cores,
-  scaled by the learning-rate schedule.
+- Token ids are mapped to normalized classes before hashing (hashing only).
+- Once per update, a sparse row-RMSprop step runs over all CPU cores, scaled by the learning-rate schedule:
+  - blocks of ~8 MB;
+  - only the touched rows are gathered and updated when few are touched (~18% per update with 32-wide rows);
+  - BF16 writes are stochastically rounded (unbiased, deterministic per seed/update/block).
 
 **4. Optimizer and schedule**
 - Dion3 on the 257 weight matrices; AdamW inside Dion3 on the embedding, norms and gates.
@@ -84,7 +91,8 @@ clip gradients -> Dion3/AdamW step (GPU) -> sparse RMSprop over the touched tabl
 | `model.py`, `config.py`, `ngram.py` | a100stack model source |
 | `bench100m.py` | Execution patches (packing, native attention, packed DeltaNet, compiled tails) |
 | `optim800k.py` | Fused norms, loss chunks |
-| `pinned_ngram.py`, `ram_ngram.py` | N-gram table in CPU RAM: lookup, gradient return, sparse update, parity checks |
+| `pinned_ngram.py`, `ram_ngram.py` | N-gram table in CPU RAM: lookup, gradient return, sparse update, stochastic rounding, parity checks |
+| `ngram_canon.py` | Normalized token classes for hashing (Engram tokenizer compression) |
 | `fast_flce.py`, `fla_nosync.py` | Loss and FLA patches, with parity checks |
 | `dion_optim.py` | Dion3 parameter grouping, concatenated projections |
 | `layer_dropout.py`, `depth_attention.py`, `delta_block.py` | Opt-in paper techniques |

@@ -4,15 +4,62 @@ Hardware: Colab NVIDIA A100-SXM4-80GB, 12 vCPUs, 167 GB RAM, PyTorch 2.11.0+cu13
 Dion3 at `microsoft/dion@58d38ad`. Data: real FineWeb. Throughput: 6 timed updates after 2 untimed ones,
 including the CPU table step and the optimizer.
 
-Raw records are in `docs/results-iteration-5.jsonl`; the full write-up is in
-`docs/findings-iteration-5.md`.
+Raw records are in `docs/results-iteration-5.jsonl` and `docs/results-iteration-6.jsonl`; the full
+write-ups are in `docs/findings-iteration-5.md` and `docs/findings-iteration-6.md`.
 
-## Throughput and GPU memory (700m preset, ~786k-token updates)
+## Current defaults (v2): 600M n-gram table, Delta Block, layer dropout
+
+**Throughput at 700M** (16k × 48 = 786k-token updates):
+
+| Setup | Tokens/s | GPU memory |
+|---|---:|---:|
+| Previous defaults (1.2B table as 4 × 585,937 × 512, 1 injection) | 27,493 | 42.1 GiB |
+| New table only (600M as 8 × 2.34M × 32, normalized hashing, 2 injections, stochastic rounding) | 28,235 | 42.0 GiB |
+| **New defaults** (new table + Delta Block + layer dropout 0.25 → 0.05), start of run (12.3% of blocks skipped) | **27,701** | 42.2 GiB |
+| Same, stochastic rounding off | 27,830 | 42.2 GiB |
+
+- **Over a full run:** layer dropout's rate decays, so the new defaults average about 26,400 tokens/s (estimate), about 4.4 days for 10B tokens.
+- **Delta Block** costs ~12% at 700M.
+- **Stochastic rounding** costs 0.12 s per update (0.4%).
+
+**The new table also moves less data per update:**
+
+| Per update | Old table | New table |
+|---|---:|---:|
+| CPU table step | 1.42 s | 0.80 s (touched rows only: ~18% of rows) |
+| Row copies to GPU | 295 ms | 39 ms |
+| Gradient copies back | 535 ms | 67 ms |
+| Peak host RAM | 21.9 GiB | 12.9 GiB |
+
+**Quality A/B on the 100M model:**
+- Setup: 300 updates × 65k tokens (~20M tokens), 30-update warmup, held-out FineWeb loss on 1M tokens, 2 seeds per arm.
+- Two injection points at blocks 2 and 11 of 20.
+- Early exit after 15 of 20 blocks.
+
+| Arm | Seed 1234 | Seed 4321 | **Mean** | Early exit (mean) |
+|---|---:|---:|---:|---:|
+| Previous table | 5.0442 | 5.0575 | 5.0509 | 5.2545 |
+| New table | 5.0286 | 5.0316 | **5.0301** (−0.021) | 5.2339 |
+| New table + Delta Block + layer dropout | 5.0349 | 5.0320 | 5.0335 (−0.017) | **5.1029** (−0.152) |
+
+- **New table:** lower loss on both seeds, by more than the seeds differ from each other.
+- **Delta Block + layer dropout on top:** neutral at full depth, much better when the last blocks are skipped. Delta Block's own effect was not isolated.
+- **Scope:** small-scale results; the 700M run at 10B tokens is the real test.
+
+**Recovery with everything on:** `kill -9` after update 8; the supervisor restarted the trainer, which resumed from
+checkpoint 6 with checksums verified. The repeated updates matched the originals: loss 11.51249 / 11.51192 vs
+11.51246 / 11.51191.
+
+**Fixed while testing:**
+- **Learning-rate bug in `trainer.py`:** the schedule's multipliers compounded into Dion3's learning rate, so with a long warmup the dense learning rates collapsed to ~0. Earlier `trainer.py` loss values were affected; throughput, memory and recovery results were not. Each update now logs the effective `lr`.
+- **Delta Block with layer dropout and early-exit evaluation** exceeded PyTorch's recompile limit at the first evaluation. The limit is now raised for these regions, and `exp.py` stops after 3 failures in a row without a new checkpoint.
+
+## Previous default: throughput and GPU memory (1.2B table, ~786k-token updates)
 
 | Setup | Tokens/s | Hours per 1B tokens | GPU memory (`nvidia-smi`) |
 |---|---:|---:|---:|
 | 10k microbatches | 26,379 | 10.5 | 30.6 GiB |
-| **16k microbatches (default)** | **27,504** | **10.1** | **42.7 GiB** |
+| 16k microbatches (previous default) | 27,504 | 10.1 | 42.7 GiB |
 | 20k microbatches | 27,502 | 10.1 | 51.2 GiB |
 | 24k microbatches | 28,145 | 9.9 | 58.1 GiB |
 | 16k + layer dropout 0.2 (constant) | 29,858 | 9.3 | 42.1 GiB |

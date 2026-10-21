@@ -159,9 +159,13 @@ configuration (10,240 × 77, Dion3, FLA sync removal, 31 GiB allocator cap). 54 
 | Graceful stop | SIGTERM at 08:56:32: update 54 finished, blocking checkpoint 54 (38 s including the step-53 write still in flight), exit 0, supervisor finished |
 | Held-out loss (1M tokens) | 11.494 (update 25), 11.457 (50), 11.450 (54); early exit after 24 of 32 blocks: 11.490, 11.449, 11.442 |
 
-The loss barely moves because the schedule warms up over 300 updates (236M tokens), and the run
-stopped at 18% of peak learning rate. This run demonstrates the mechanics, not convergence. Rerunning
-`bash train700m.sh` continues from update 54.
+**Correction:** the loss barely moved because of a trainer bug, not the warmup. Dion3 keeps each group's
+learning rate as a persistent device tensor, and the trainer used that tensor as its base rate, so every
+schedule multiplier compounded into it. With a 300-update warmup the dense learning rates collapsed to
+nearly zero within a few updates; only the n-gram table kept learning. Fixed in commit `77ff585`. The
+throughput, memory, checkpoint and resume results of this run are unaffected (they don't depend on the
+learning rate's value); its loss values are not meaningful. Rerunning `bash train700m.sh` continues
+from update 54 with the fix.
 
 ## 5. Two CMP 170HX: `run.py`
 

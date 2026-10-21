@@ -54,8 +54,15 @@ SHAPE_KEYS = {"d_model", "n_layers", "full_attn_every", "n_heads", "n_kv_heads",
               "ngram.heads_per_order", "ngram.lr", "ngram.beta2", "ngram.canonical_tokens",
               "ngram.stochastic_round"}
 
-# Measured on one A100-SXM4-80GB, 700m preset, ~786k-token updates, current stack (see RESULTS.md).
-MEASURED = {10240: (26379, 30.6), 16384: (27504, 42.7), 20480: (27502, 51.2), 24576: (28145, 58.1)}
+# Measured on one A100-SXM4-80GB, 700m preset, ~786k-token updates (see RESULTS.md), keyed by
+# (micro_tokens, delta_block, layer_drop > 0): (tokens/s for the time estimate, GPU GiB, note).
+MEASURED = {
+    (16384, True, True): (26400, 42.2, "27,700 measured at the start with 12% of blocks skipped; "
+                                       "~26,400 estimated over the run as layer dropout decays"),
+    (16384, False, False): (28235, 42.0, "measured"),
+    (10240, False, False): (26379, 30.6, "measured with the previous 1.2B table"),
+    (24576, False, False): (28145, 58.1, "measured with the previous 1.2B table"),
+}
 
 
 def split_key(key):
@@ -146,15 +153,15 @@ def summary(config):
     lines = [f"run {config['run']['name']}: {m['preset']} preset, {m['ngram_params'] / 1e9:.2f}B n-gram table",
              f"update {b['micro_tokens']:,} x {b['grad_accum']} = {update:,} tokens; schedule {s['steps']:,} updates "
              f"= {update * s['steps'] / 1e9:.2f}B tokens, warmup {s['warmup_steps']} updates"]
-    if m["preset"] == "700m" and not m.get("shape") and b["micro_tokens"] in MEASURED:
-        tps, gib = MEASURED[b["micro_tokens"]]
-        if m.get("layer_drop"):
-            tps = int(tps * (1 + 0.43 * m["layer_drop"]))   # ~+8.6% at p_max 0.2, constant schedule
+    model_shape = [k for k in m.get("shape", {}) if not k.startswith("ngram.")]
+    key = (b["micro_tokens"], bool(m.get("delta_block")), bool(m.get("layer_drop")))
+    if m["preset"] == "700m" and not model_shape and key in MEASURED:
+        tps, gib, note = MEASURED[key]
         hours = update * s["steps"] / tps / 3600
-        lines.append(f"A100-80GB reference: ~{tps:,} tokens/s, ~{gib} GiB GPU memory, "
+        lines.append(f"A100-80GB reference: ~{tps:,} tokens/s ({note}), ~{gib} GiB GPU memory, "
                      f"full schedule ~{hours:.0f} h ({hours / 24:.1f} days)")
     if m.get("delta_block"):
-        lines.append("delta_block on: measured -14% throughput in this stack (see SETTINGS.md)")
+        lines.append("delta_block on: ~12% slower than without it on the A100 (see SETTINGS.md)")
     return "\n".join(lines)
 
 

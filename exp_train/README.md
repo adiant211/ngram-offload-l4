@@ -1,13 +1,15 @@
-# exp_train: 700M hybrid LM + 1.2B n-gram table, one GPU
+# exp_train: 700M hybrid LM + 600M n-gram table, one GPU
 
 A ready-to-run, easy-to-tweak training setup:
 
-- **Model:** a 716M-parameter hybrid language model (24 Gated DeltaNet + 8 gated attention layers, width 1,280) with a 1.2B-parameter hashed n-gram memory kept in CPU RAM.
+- **Model:** a 714M-parameter hybrid language model (24 Gated DeltaNet + 8 gated attention layers, width 1,280) with a 600M-parameter hashed n-gram memory kept in CPU RAM:
+  - **Memory:** 8 hash tables of 32-wide rows, read with normalized token ids and added at two depths.
+  - **On by default:** Delta Block attention residuals, and layer dropout falling from 0.25 to 0.05 by the start of the learning-rate decay.
 - **Tokenizer:** the 60,800-token tokenizer, in `tokenizer/`.
 - **Settings:** everything lives in **one file, `exp_config.toml`**.
 
-On one A100-80GB the default trains at **~27,500 tokens/s using ~43 GB of GPU memory**, and a crashed
-or stopped run resumes from its last checkpoint by itself.
+On one A100-80GB the default trains at **~27,700 tokens/s at the start and ~26,400 averaged over a run, using
+~42 GB of GPU memory**, and a crashed or stopped run resumes from its last checkpoint by itself.
 
 ## Quick start
 
@@ -25,7 +27,7 @@ Run `python exp.py train` again (same `run.name`) to continue where it stopped.
 | | Default settings | Smaller-memory profile (`micro_tokens = 10240`, `grad_accum = 77`) |
 |---|---|---|
 | GPU | NVIDIA, BF16, ≥ 48 GB (A100-80GB tested) | ≥ 34 GB |
-| Host RAM | ≥ 48 GB (table 2.4 GB + 4.8 GB gradient buffer + checkpoint copies; 35 GB peak measured) | same |
+| Host RAM | ≥ 32 GB (table 1.2 GB + 2.4 GB gradient buffer + checkpoint copies; 12.9 GiB peak measured between checkpoints) | same |
 | CPU | the n-gram table update uses all cores; 12 vCPUs tested | same |
 | Disk | data (2 bytes/token) + 2 checkpoints × 8.8 GB + compile cache ~2 GB | same |
 | Software | Linux, Python ≥ 3.11, PyTorch 2.11 + CUDA, `flash-linear-attention==0.5.2`, Dion3 (`setup.sh`) | same |
@@ -49,7 +51,9 @@ Run `python exp.py train` again (same `run.name`) to continue where it stopped.
 
 ```bash
 python exp.py train --set run.name=lowmem --set batch.micro_tokens=10240 --set batch.grad_accum=77 --set performance.gpu_mem_cap_gib=31
-python exp.py train --set run.name=ld02 --set model.layer_drop=0.2          # +8.6% throughput, changes training
+python exp.py train --set run.name=nodelta --set model.delta_block=false    # ~12% faster without Delta Block
+python exp.py train --set run.name=nold --set model.layer_drop=0            # layer dropout off
+python exp.py train --set run.name=wide --set 'model.shape."ngram.dim"=64' --set 'model.shape."ngram.heads_per_order"=2'   # 600M as 4 x 2.34M x 64
 python exp.py train --set run.name=short --set schedule.max_minutes=60       # one hour, then checkpoint and stop
 python exp.py train --dry-run                                                # show the command, run nothing
 ```

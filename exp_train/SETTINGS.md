@@ -22,6 +22,9 @@ reports it is about **11 GiB + 1.95 GiB per 1,024 microbatch tokens**.
 Keep `micro_tokens × grad_accum` near 786k when you switch profiles, so the training recipe stays the
 same.
 
+The table rows were measured with the previous 1.2B table and without Delta Block. The default 600M table
+uses about the same GPU memory (42.0 vs 42.7 GiB at 16k); Delta Block adds ~0.2 GiB.
+
 ## [run]
 
 | Key | Default | Meaning |
@@ -47,29 +50,40 @@ same.
 | Key | Default | Meaning and measured effect |
 |---|---|---|
 | `preset` | `700m` | `700m`: 32 layers × 1,280, 716M dense. `500m`: 32 × 1,024, ~494M. `100m`: 20 × 512, 100M (the L4 experiments). |
-| `ngram_params` | 1.2B | Size of the hashed bigram/trigram table in CPU RAM. Costs 2 bytes/param for the table plus 4 bytes/param for the gradient buffer (7.2 GB at 1.2B). The end-of-update CPU table step scales with it (1.4 s at 1.2B). |
-| `layer_drop` | 0.0 | Layer dropout (arXiv:2609.05275), maximum drop rate. **0.2: +8.6% throughput** (constant schedule), same memory. With the paper's decreasing schedule the average gain over a run is about half. Full-depth loss neutral (within seed noise) in a 100M A/B; much better early-exit loss. Changes training, so it's opt-in. |
-| `layer_drop_dist` | `ild` | `ild`: drop rate rises linearly with depth (paper default). |
-| `layer_drop_schedule` | `decreasing` | `decreasing` to 0 over the schedule (paper). `constant` gives the full speedup all the time. |
+| `ngram_params` | 600M | Size of the hashed bigram/trigram table in CPU RAM. Its shape is set in `[model.shape]` (default: 8 tables × 2,343,750 rows × 32). Costs 2 bytes/param for the table plus 4 bytes/param for the gradient buffer (3.6 GB at 600M). The previous default was 1.2B as 4 × 585,937 × 512. |
+| `layer_drop` | 0.25 | Layer dropout (arXiv:2609.05275): starting drop rate of the deepest block. The rate rises linearly with depth from 0 at the first block (`ild`), so at the start ~12.5% of blocks are skipped per microbatch. Dropped blocks are not computed. Full-depth loss neutral (within seed noise) in an earlier 100M A/B; much better early-exit loss. At 700M: +11.3% throughput at the starting rate (12.3% of blocks skipped); about +6% averaged over a run with these defaults (estimate). 100M A/B: much better early-exit loss. |
+| `layer_drop_dist` | `ild` | `ild`: drop rate rises linearly with depth (paper default). `uniform`; `ald`: every other layer. |
+| `layer_drop_schedule` | `decreasing` | `decreasing`: linear from `layer_drop` to `layer_drop_final`, reached at `layer_drop_end`, then held. `constant`: `layer_drop` throughout. `increasing`. |
+| `layer_drop_final` | 0.05 | Rate held from `layer_drop_end` to the end of training. 0 = the paper's schedule. |
+| `layer_drop_end` | `"decay"` | When `layer_drop_final` is reached. `"decay"`: when the learning-rate decay starts (80% of the schedule with `decay_frac = 0.2`), or a fraction of the schedule (`1.0` = the end). Averaged over a whole run, ~6.5% of blocks are skipped with the defaults. |
 | `depth_attn` | `off` | Depth-Attention (arXiv:2606.05014) on the 8 attention layers. −0.8% throughput (L4 measurement). Quality gain unconfirmed: −0.045 loss in one paired 100M A/B, inside the 0.025 seed noise. |
-| `delta_block` | false | Delta Block attention residuals (Luo, Cai, Hu). **−14% throughput** here (22,637 vs 26,379 tokens/s at 10k), +0.15 GiB. Reported −1.7 to −2.6% perplexity at 533M–1B; not A/B-tested on this model. |
+| `delta_block` | true | Delta Block attention residuals (Luo, Cai, Hu): each sublayer input mixes block-level depth sources. At 700M it costs ~12% throughput (with layer dropout on) and +0.15 GiB. In the 100M A/B, Delta Block + layer dropout were neutral at full depth (+0.003 loss) and −0.13 with early exit; Delta Block's own effect was not isolated. The authors report +0.6 points downstream accuracy (Qwen3-0.6B fine-tune) and 1.7–2.6% lower perplexity (533M–1B). |
 | `delta_blocks` | 4 | Depth blocks (sources). 4 → blocks of 8 layers. |
 | `delta_variant` | `repo` | `repo`: the published code (its sources are alternating sums beyond the second block). `paper`: true block deltas. |
 
-### [model.shape] (optional)
+### [model.shape]
 
-These keys override fields of the preset, so you can try other shapes. The keys are `d_model`,
-`n_layers`, `full_attn_every`, `n_heads`, `n_kv_heads`, `head_dim`, `gdn_heads`, `gdn_head_dim`,
-`ffn_dim`, `rope_theta` and the n-gram fields `"ngram.dim"`, `"ngram.inject_layers"`, `"ngram.orders"`,
-`"ngram.heads_per_order"`, `"ngram.lr"` and `"ngram.beta2"`.
+These keys override fields of the preset. The n-gram keys are quoted because they contain a dot;
+`--set` accepts them too: `--set 'model.shape."ngram.dim"=64'`.
 
-Rules:
-- `n_heads × head_dim = d_model` and `gdn_heads × gdn_head_dim = d_model`.
-- `n_heads` must be a multiple of `n_kv_heads`.
-- `ffn_dim` should be a multiple of 128.
+| Key | Default | Meaning |
+|---|---|---|
+| `"ngram.heads_per_order"` | 4 | Hash functions per n-gram order. Bigram + trigram × 4 = 8 tables. More, narrower tables lower the share of each row's signal that comes from colliding n-grams. |
+| `"ngram.dim"` | 32 | Row width. Rows = `ngram_params / (tables × dim)` = 2,343,750 per table. |
+| `"ngram.inject_layers"` | [1, 15] | Where the memory is added to the residual stream: before block 2 and before block 16 (of 32), as in Engram's 2 + 15 of 30. One lookup is shared; each point has its own projection and gate. |
+| `"ngram.canonical_tokens"` | true | Hash normalized token ids (Engram's tokenizer compression: NFKC, accents stripped, lowercase, whitespace collapsed). 60,800 ids fold to 45,455 for hashing only; the model's embedding and targets are unchanged. The map's checksum is stored in each checkpoint. |
+| `"ngram.stochastic_round"` | true | Round the BF16 table updates stochastically instead of to nearest: unbiased, so small updates to large rows aren't lost. The draws are deterministic per (seed, update, block), so resumed runs repeat them. |
+| `"ngram.orders"`, `"ngram.lr"`, `"ngram.beta2"` | (2, 3), 0.02, 0.99 | N-gram orders and the sparse RMSprop settings. |
 
-After a shape change, the memory table and the A100 reference speed no longer apply. Re-measure with a
-short run (`schedule.max_minutes = 15`), and set `eval.eval_exit_at` below `n_layers`.
+The model itself can be changed with `d_model`, `n_layers`, `full_attn_every`, `n_heads`, `n_kv_heads`,
+`head_dim`, `gdn_heads`, `gdn_head_dim`, `ffn_dim` and `rope_theta`. Rules:
+- `n_heads × head_dim = d_model` and `gdn_heads × gdn_head_dim = d_model`;
+- `n_heads` must be a multiple of `n_kv_heads`;
+- `ffn_dim` should be a multiple of 128;
+- `"ngram.inject_layers"` and `eval.eval_exit_at` must stay below `n_layers`.
+
+After changing the model itself, the memory table and the A100 reference speed no longer apply. Re-measure with
+a short run (`schedule.max_minutes = 15`).
 
 ## [batch]
 
@@ -86,7 +100,7 @@ Warmup-stable-decay. The schedule also scales the n-gram table's learning rate.
 | Key | Default | Meaning |
 |---|---|---|
 | `steps` | 12,716 | Schedule length in updates. Total tokens = `steps × micro_tokens × grad_accum` (10.0B by default). |
-| `warmup_steps` | 300 | Linear warmup (236M tokens). The loss barely moves during the first ~100 updates; that's expected. |
+| `warmup_steps` | 300 | Linear warmup (236M tokens). Each update logs the effective matrix learning rate as `lr`. |
 | `decay_frac` | 0.2 | The last 20% of updates decay to `min_lr_frac`. |
 | `min_lr_frac` | 0.0 | Final learning-rate fraction. |
 | `stop_at` | 0 | End this invocation after update N; resume later continues the same schedule. |

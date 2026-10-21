@@ -56,6 +56,15 @@ Details, equivalence tests and the quality A/B are in [docs/a100stack-iteration-
 
 Throughput plateaus at 16k-token microbatches; 24k buys 2.3% for 15 GiB more. Layer dropout (p_max 0.2) adds 8.6%. Delta Block attention residuals (`--delta-block`, ported from Luo, Cai and Hu's published code) are available but cost 14% throughput in this stack. A supervised run was killed with `kill -9` and resumed from its checkpoint automatically, with matching losses. See [docs/a100stack-iteration-5-findings.md](docs/a100stack-iteration-5-findings.md).
 
+### Iteration 6: n-gram upgrade, Delta Block and layer dropout on, learning-rate fix
+
+- **N-gram memory:** 600M as 8 tables × 2,343,750 rows × 32, with normalized-token hashing (`ngram_canon.py`), a second injection point and stochastic rounding of the BF16 table writes. Only the touched rows are updated per step.
+- **100M A/B (2 seeds):** −0.021 held-out loss versus the 1.2B table, and 16% faster at that size.
+- **700M throughput:** 28,235 tokens/s with the new table; 27,701 with Delta Block and layer dropout (0.25 → 0.05) also on.
+- **Fixed: compounding learning rate under Dion3 in `trainer.py`.** With a long warmup the dense learning rates collapsed to ~0, so earlier `trainer.py` loss values are not meaningful. Throughput, memory and recovery results stand.
+
+See [docs/a100stack-iteration-6-findings.md](docs/a100stack-iteration-6-findings.md).
+
 ## How it works
 
 - **The n-gram table lives in pinned host RAM.** Each microbatch, the CPU hashes token ids, gathers the needed rows into reusable pinned buffers and ships them to the GPU asynchronously. The row gradients come back on a separate CUDA stream and a CPU worker accumulates them while the GPU keeps computing ([pinned_ngram.py](pinned_ngram.py)).
@@ -82,12 +91,14 @@ Throughput plateaus at 16k-token microbatches; 24k buys 2.3% for 15 GiB more. La
 | `recovery_test.sh` | Crash/resume/SIGTERM test at full model size |
 | `a100_sweep.sh` | A100 microbatch/memory/layer-dropout throughput sweep |
 | `delta_block.py` | Delta Block attention residuals (opt-in `--delta-block`), fused into the compiled regions, with an FP32 equivalence check against the published code |
+| `ngram_canon.py` | Normalized token classes for n-gram hashing (Engram tokenizer compression) |
 | `fla_nosync.py` | Removes FLA 0.5.2's per-microbatch CPU-GPU syncs (chunk tables, CE backward), with a parity check |
 | `prepare_fineweb.py` | Batched FineWeb tokenization into disjoint train/held-out files (300M tokens in ~5 min) |
 | `optim800k.py` | Fused-norm swap and precision experiments |
 | `prepare800k.py` | Builds the bounded, revision-pinned FineWeb fixture |
 | `iter3_colab.sh` | Colab runner: `setup`, `parity`, `sweep`, `confirm`, `fastce`, `dion`, `dist`, `layerdrop`, `depthab`, `profile` |
 | `run-selected-iter3.sh` | The recommended recipe |
+| `results/results-iteration-6.jsonl` | Iteration-6 throughput, A/B and recovery records |
 | `results/results-iter5.jsonl` | A100 sweep, kernel profiles, sync sites, recovery test and supervised-run records |
 | `results/results-iter3.jsonl` | Raw records for all nine iteration-3 runs, with stage timings |
 | `docs/` | Findings from every iteration, oldest to newest: 100m → ram-2560 → batch-scaling → batch6 → 800k-7gb → iteration-3 |
