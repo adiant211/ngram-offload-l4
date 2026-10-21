@@ -623,9 +623,12 @@ def main():
         due = bool(flags[2]) or (args.ckpt_every and done % args.ckpt_every == 0)
         final = done == last_step
         if due or stopping or (final and (args.ckpt_every or args.ckpt_minutes)):
+            stall = time.perf_counter()
             files, meta = snapshot(done)
             ckpt.save(done, files, meta, blocking=stopping or final)
             last_ckpt_time = time.time()
+            log("CHECKPOINT_STALL", json.dumps(dict(step=done, seconds=round(time.perf_counter() - stall, 2),
+                                                    blocking=stopping or final)))
             if done == args.crash_at_step and args.crash_point == "during-save":
                 print("CRASH_TEST", json.dumps(dict(step=done, point="during-save")), flush=True)
                 os._exit(17)
