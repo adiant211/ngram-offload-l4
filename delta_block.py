@@ -89,6 +89,12 @@ def install(model, num_blocks=4, variant="repo", compile_mode="default", compile
         "the Delta Block path does not implement activation checkpointing"
     layers = len(model.blocks)
     per_block = max(1, math.ceil(layers / num_blocks))
+    # Every block shares the same two compiled functions: 1-4 sources x grad mode x layer-dropout
+    # scale inputs exceed Dynamo's default limit of 8 variants (an error under fullgraph).
+    import torch._dynamo.config as dynamo_config
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(dynamo_config, name):
+            setattr(dynamo_config, name, max(getattr(dynamo_config, name), 64))
     d = model.c.d_model
     device = model.embed.weight.device
     generator = torch.Generator(device="cpu").manual_seed(4242)
