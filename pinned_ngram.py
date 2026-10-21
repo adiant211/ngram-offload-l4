@@ -468,9 +468,11 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
         # Several blocks, including a partial last block, on the 4,096-row test table.
         candidates[mode]._update_block = 1000
         candidates[mode]._gather_below = 2.0 if mode == "gather" else 0.0
-    # Stochastic rounding may land one BF16 ulp away from round-to-nearest on each update,
-    # which also shows in the next update's looked-up rows.
-    tol = dict(rtol=0.008, atol=0.001) if stochastic else dict(rtol=0.004, atol=0.0005)
+    # Stochastic rounding may land one BF16 ulp away from the reference on each update, also in the
+    # next update's looked-up rows. Early RMSprop steps reach ~1 per element, where one ulp is 2^-7;
+    # the reference also rounds the step to BF16 before adding it. The mean difference must stay
+    # small, so a systematic error still fails.
+    tol = dict(rtol=0.008, atol=0.016) if stochastic else dict(rtol=0.004, atol=0.0005)
     for step in range(2):
         for candidate in candidates.values():
             candidate._sr_step = step
@@ -491,6 +493,9 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
         for candidate in candidates.values():
             assert candidate.sparse_step() == touched
             torch.testing.assert_close(reference.table.cpu(), candidate.table.cpu(), **tol)
+            if stochastic:
+                drift = float((reference.table.cpu().float() - candidate.table.cpu().float()).abs().mean())
+                assert drift < 1e-3, drift
             torch.testing.assert_close(reference.row_v.cpu(), candidate.row_v.cpu(), rtol=1e-4, atol=1e-6)
             assert not candidate._host_touched.any() and not candidate._host_grad.any()
             assert candidate._cpu_next is None
@@ -507,7 +512,7 @@ def check_pinned(gpu_table=False, canon=False, stochastic=False):
     modes = tuple(candidates)
     print("PINNED_PARITY: two updates, buffer reuse and CPU-input handoff passed; GPU table:",
           gpu_table, "updates:", modes, "canonical ids:", canon, "stochastic rounding:", stochastic,
-          "block table bit-identical:", len(modes) == 2 and not stochastic, flush=True)
+          "block tables bit-identical to rows:", "blocks" in candidates and not stochastic, flush=True)
 
 
 def check_stochastic_round():
