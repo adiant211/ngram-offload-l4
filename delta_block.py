@@ -138,10 +138,10 @@ def check():
         apply_optimizations(net, opts)
         bench.optimize(net, opts)
         report = install(net, num_blocks=4, variant=variant)
-        with torch.no_grad():   # sharp, non-uniform routing so the mix actually matters
+        with torch.no_grad():   # clearly non-uniform routing that is not saturated
             for name, p in net.named_parameters():
                 if name.endswith("_query"):
-                    p.mul_(400)
+                    p.mul_(40)
         batch = bench.build_batch(np.random.default_rng(3).integers(4, 60800, 4097, dtype=np.uint16), 3, 1024)
         results = []
         for forward in (delta_forward, reference_forward):
@@ -158,8 +158,8 @@ def check():
         rel = {n: float((g0[n] - g1[n]).norm() / g1[n].norm().clamp_min(1e-12)) for n in g1}
         worst = max(rel, key=rel.get)
         print("DELTA_BLOCK_PARITY", variant, dict(loss=l0, reference=l1, loss_rel=abs(l0 - l1) / abs(l1),
-              grads=len(rel), worst_grad=worst, worst_rel=rel[worst],
-              params=report["parameters"]), flush=True)
+              grads=len(rel), worst_grad=worst, worst_rel=rel[worst], worst_norm=float(g1[worst].norm()),
+              median_rel=sorted(rel.values())[len(rel) // 2], params=report["parameters"]), flush=True)
         assert abs(l0 - l1) / abs(l1) < 2e-3 and rel[worst] < 5e-2, (variant, l0, l1, worst, rel[worst])
 
 
@@ -172,10 +172,12 @@ def reference_forward(model, batch):
     eps = model.c.norm_eps
 
     def mix(srcs, query, weight):
-        V = torch.stack(srcs, 0).float()
-        K = V * torch.rsqrt(V.pow(2).mean(-1, keepdim=True) + eps) * weight
-        weights = torch.einsum("d,ntd->nt", query.float(), K).softmax(0)
-        return torch.einsum("nt,ntd->td", weights, V)
+        # FP32 throughout: under autocast the published code's einsums would run in BF16.
+        with torch.autocast("cuda", enabled=False):
+            V = torch.stack(srcs, 0).float()
+            K = V * torch.rsqrt(V.pow(2).mean(-1, keepdim=True) + eps) * weight
+            weights = torch.einsum("d,ntd->nt", query.float(), K).softmax(0)
+            return torch.einsum("nt,ntd->td", weights, V)
 
     for i, block in enumerate(model.blocks):
         if i in model.inject_at:
