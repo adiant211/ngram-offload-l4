@@ -158,6 +158,11 @@ def summary(config):
     return "\n".join(lines)
 
 
+def newest_checkpoint(rd):
+    done = sorted(d.name for d in (rd / "ckpt").glob("step_*") if (d / "COMPLETE").exists())
+    return done[-1] if done else None
+
+
 def train(config, args):
     rd = run_dir(config)
     cmd = [sys.executable, "-u", "trainer.py"] + trainer_args(config)
@@ -182,8 +187,9 @@ def train(config, args):
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
     log = open(rd / "train.log", "a")
-    code = 1
+    code, stalled = 1, 0
     for attempt in range(config["run"].get("max_restarts", 20) + 1):
+        before = newest_checkpoint(rd)
         message = f"SUPERVISOR start {attempt} {time.strftime('%Y-%m-%d %H:%M:%S')}"
         print(message, flush=True)
         log.write(message + "\n")
@@ -197,6 +203,13 @@ def train(config, args):
             log.flush()
         code = state["child"].wait()
         if code == 0 or state["stop"]:
+            break
+        # A failure that repeats without any new checkpoint would loop forever: stop and report it.
+        stalled = stalled + 1 if newest_checkpoint(rd) == before else 0
+        if stalled >= 3:
+            message = "SUPERVISOR 3 failures in a row without a new checkpoint: giving up, see train.log"
+            print(message, flush=True)
+            log.write(message + chr(10))
             break
         message = f"SUPERVISOR trainer exited with {code}; resuming from the last checkpoint in 15 s"
         print(message, flush=True)
